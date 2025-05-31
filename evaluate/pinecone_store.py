@@ -1,13 +1,13 @@
 """
 Pinecone store for DNA2Vec embeddings
 
-This usually crashes in the first run but succeeds in the second 0_o
-Issues with API timeout on DB creation
-Unstable: https://github.com/pinecone-io/pinecone-python-client/issues
+Updated for new Pinecone client (v3.0+)
 """
 import string
-import pinecone
+import re
+from pinecone import Pinecone, ServerlessSpec
 import torch
+import numpy as np
 from tqdm import tqdm
 import random
 from inference_models import EvalModel, Baseline
@@ -40,44 +40,79 @@ class PineconeStore:
                 device = device
             )
 
+        # Sanitize index name to ensure it meets Pinecone requirements
+        index_name = self._sanitize_index_name(index_name)
+        
         if "config-" in index_name: # premium account
-            self.api_key = "ded0a046-d0fe-4f8a-b45c-1d6274ad555e"
-            self.environment = "us-west4-gcp"
-            
+            self.api_key = "pcsk_6YUeeT_Lba6F6sD3Vwo6RDqrgLj8bUqWem4vYbLSFvq73Pts9qyUM3m9boP6eAVMbFdjko"
+            self.environment = "us-east-1"
         else:
             raise NotImplementedError("Name not identified.")
         
         self.initialize_pinecone_upsertion(metric, index_name)
         self.index_name = index_name
 
+    @staticmethod
+    def _sanitize_index_name(index_name: str) -> str:
+        """Sanitize index name to meet Pinecone requirements (lowercase alphanumeric or hyphen)."""
+        # Convert to lowercase and replace invalid characters with hyphens
+        sanitized = index_name.lower()
+        sanitized = re.sub(r'[^a-z0-9-]', '-', sanitized)
+        # Remove consecutive hyphens and leading/trailing hyphens
+        sanitized = re.sub(r'-+', '-', sanitized).strip('-')
+        if not re.match(r'^[a-z0-9-]+$', sanitized):
+            raise ValueError(f"Invalid index name: {sanitized}. Must contain only lowercase alphanumeric characters or hyphens.")
+        return sanitized
+
     def initialize_pinecone_upsertion(
         self, 
         metric: str, 
         index_name: str
     ):
-        pinecone.init(
-            api_key=self.api_key, 
-            environment=self.environment
-        )
+        # Initialize Pinecone client with new syntax
+        self.pc = Pinecone(api_key=self.api_key)
 
-        # only create index if it doesn't exist
-        if index_name not in pinecone.list_indexes():
+        # Check if index exists
+        try:
+            existing_indexes = [index.name for index in self.pc.list_indexes()]
+        except Exception:
+            # Fallback for different API versions
+            existing_indexes = self.pc.list_indexes()
+        
+        if index_name not in existing_indexes:
             print(f"Creating new index, {index_name}")
             
             try:
                 dimension = self.model.get_sentence_embedding_dimension()
             except:
                 dimension = 384
-                
-            pinecone.create_index(
-                name=index_name,
-                dimension=dimension,
-                metric=metric,
-                pod_type="s1.x4"
-            )
+            
+            # Create index with new syntax
+            try:
+                self.pc.create_index(
+                    name=index_name,
+                    dimension=dimension,
+                    metric=metric,
+                    spec=ServerlessSpec(
+                        cloud='aws',
+                        region=self.environment
+                    )
+                )
+            except Exception as e:
+                print(f"Failed to create index with ServerlessSpec, trying alternative method: {e}")
+                # Fallback with spec included
+                self.pc.create_index(
+                    name=index_name,
+                    dimension=dimension,
+                    metric=metric,
+                    spec=ServerlessSpec(
+                        cloud='aws',
+                        region=self.environment
+                    )
+                )
 
-        # now connect to the index
-        self.index = pinecone.GRPCIndex(index_name)
+        # Connect to the index
+        self.index = self.pc.Index(index_name)
 
     @staticmethod
     def batched_data_generator(file_path, batch_size):
@@ -113,13 +148,10 @@ class PineconeStore:
             if batch:
                 yield batch, namespace
 
-
     @staticmethod
-    def generate_random_string(length: str = 20):
+    def generate_random_string(length: int = 20):
         letters = string.ascii_lowercase
         return "".join(random.choice(letters) for _ in range(length))
-
-
 
     def trigger_pinecone_upsertion(self, file_paths: list, 
                                    batch_size: int = 100, add_namespace=False):
@@ -128,7 +160,7 @@ class PineconeStore:
         for file_path in file_paths:
             batches = PineconeStore.batched_data_generator(file_path, batch_size)
 
-            for _, (batch,namespace) in tqdm(enumerate(batches)):
+            for _, (batch, namespace) in tqdm(enumerate(batches)):
                 ids = [PineconeStore.generate_random_string() for _ in range(len(batch))]
 
                 # create metadata batch - we can add context here
@@ -138,7 +170,12 @@ class PineconeStore:
                 xc = self.model.encode(texts)
 
                 # create records list for upsert
-                records = zip(ids, xc, metadatas)
+                if isinstance(xc, torch.Tensor):
+                    xc = xc.tolist()
+                elif isinstance(xc, np.ndarray):
+                    xc = xc.tolist()
+                records = list(zip(ids, xc, metadatas))
+                
                 # upsert to Pinecone
                 if add_namespace:
                     self.index.upsert(vectors=records, namespace=namespace)
@@ -146,30 +183,25 @@ class PineconeStore:
                     self.index.upsert(vectors=records)
 
         # check number of records in the index
-        self.index.describe_index_stats()
+        print(self.index.describe_index_stats())
 
-
-
-    # def query(self, query, top_k=5):  # consider batching if slow
-    #     # create the query vector
-    #     xq = self.model.encode(query).tolist()
-    #     # now query
-    #     xc = self.index.query(xq, top_k=top_k, include_metadata=True)
-    #     return xc
-
-    
-    def query_batch(self, queries, indices, top_k=5, hotstart_list=None, meta_dict=None, prioritize=False):  # consider batching if slow
+    def query_batch(self, queries, indices, top_k=5, hotstart_list=None, meta_dict=None, prioritize=False):
         
         # create the query vector
-        xqs = self.model.encode(queries).tolist()
+        xqs = self.model.encode(queries)
+        if isinstance(xqs, torch.Tensor):
+            xqs = xqs.tolist()
+        elif isinstance(xqs, np.ndarray):
+            xqs = xqs.tolist()
+        
         all_results = []
         
         def query_single(xq, query, index, single_hotstart):
             if not prioritize:
-                xc = self.index.query(xq, top_k=top_k, include_metadata=True)
+                xc = self.index.query(vector=xq, top_k=top_k, include_metadata=True)
             else:
-                xc = self.index.query(xq, top_k=top_k, include_metadata=True,
-                                      namespace = single_hotstart)
+                xc = self.index.query(vector=xq, top_k=top_k, include_metadata=True,
+                                      namespace=single_hotstart)
             
             xc["query"] = query
             xc["index"] = index
@@ -184,8 +216,6 @@ class PineconeStore:
                 all_results.append(future.result())
                 
         else:
-            # for xq, query, index, single_hotstart in zip(xqs, queries, indices, hotstart_list):
-            #     all_results.append(query_single(xq, query, index, single_hotstart))
             with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
                 futures = [executor.submit(query_single, xq, query, index, single_hotstart) \
                     for xq, query, index, single_hotstart in zip(xqs, queries, indices, hotstart_list)]
@@ -195,13 +225,9 @@ class PineconeStore:
 
         return all_results
     
-    
-    def drop_table(self):  # times out for large data!
-        pinecone.delete_index(self.index_name)
-
-
-
-
+    def drop_table(self):
+        """Delete the index"""
+        self.pc.delete_index(self.index_name)
 
 
 if __name__ == "__main__":
@@ -224,11 +250,6 @@ if __name__ == "__main__":
         device="cuda:3", 
         index_name=args.indexname
     )
-
-    # if args.reupload == "y":
-    #     pinecone_obj.trigger_pinecone_upsertion(
-    #         file_path=args.inputpath
-    #     )
 
     if args.drop == "y":
         pinecone_obj.drop_table()

@@ -5,7 +5,7 @@ from dna2vec.config_schema import DatasetConfigSchemaUniformSampling
 parser = argparse.ArgumentParser(description="Config upsert")
 parser.add_argument('--recipes', type=str)
 parser.add_argument('--checkpoints', type=str)
-parser.add_argument('--device', type=str)
+parser.add_argument('--device', type=str, default="cuda:0")
 parser.add_argument('--namespace', type=bool)
 
 

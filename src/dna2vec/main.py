@@ -62,9 +62,9 @@ def main(config: ConfigSchema, wandb_mode: str = "online", watch_watch: bool = T
     )
 
     # log config to wandb
-    wandb.init(project="dna2vec", config=cfg_to_wandb_dict(config), mode=wandb_mode)
-    if watch_watch:
-        wandb.watch(model, log="all", log_freq=1, log_graph=True) # just for debugging
+    #wandb.init(project="dna2vec", config=cfg_to_wandb_dict(config), mode=wandb_mode)
+    #if watch_watch:
+    #    wandb.watch(model, log="all", log_freq=1, log_graph=True) # just for debugging
 
     # TRAINING: Training loop
     trainer.train(

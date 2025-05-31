@@ -1,7 +1,7 @@
 import os
-os.environ["DNA2VEC_CACHE_DIR"] = "/mnt/SSD2/pholur/dna2vec"
+os.environ["DNA2VEC_CACHE_DIR"] = "/home/mahaotian/Dev/ESA"
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 from helpers import raw_fasta_files
 import numpy as np
@@ -43,12 +43,12 @@ from pinecone_store import PineconeStore
 
 
 grid = {
-    "read_length": [100, 150], #[150, 300, 500],
-    "insertion_rate": [0.0, 0.01],
-    "deletion_rate" : [0.0, 0.01],
+    "read_length": [250], #[150, 300, 500],
+    "insertion_rate": [0.01],
+    "deletion_rate" : [0.01],
     "qq": [(30,60), (60,90)], # https://www.illumina.com/documents/products/technotes/technote_Q-Scores.pdf
-    "topk": [1250], #[50, 100],
-    "distance_bound": [5],
+    "topk": [75, 100], #[50, 100],
+    "distance_bound": [15],
     "exactness": [2]
 }
 
@@ -86,7 +86,7 @@ def control_meta_map(path):
 
 if __name__ == "__main__":
     
-    meta_data_map = control_meta_map("test_cache/logs/headers")
+    meta_data_map = control_meta_map("/home/mahaotian/Dev/ESA/evaluate/test_cache/logs/headers")
     
     args = parser.parse_args()
     fasta_file_path = raw_fasta_files[args.recipe]
@@ -122,6 +122,7 @@ if __name__ == "__main__":
                     grid["distance_bound"], grid["exactness"]):
             
             distributed = False
+            per_k = 0
             if topk > 100:
                 print("WARNING: Enabling default equal sampling from all chromosomes")
                 print("WARNING: Currently only executes the hotstart.")

@@ -5,6 +5,7 @@
 Ensure that your data folder `datapath` contains a subfolder for each section (in our case `chromosome_*`) and within each subfolder there is a `.fasta` file containing the genome (as a `string`) of that subsection.
 
 ### Step 1. Collate the data to stage upstream into Pinecone
+> python stage_upstream.py --datapath ../../Data/data/chromosome_2/ --mode_train hard_serialized --rawfile chr2.fasta --unit_length 1000 --meta CH2 --overlap 200 --topath floodfill.pkl --ntrain 500000
 Use: `stage_upstream.py`. Arguments:
 ```bash
 python stage_upstream 
@@ -27,6 +28,7 @@ python stage_upstream.py --datapath data/chromosome_2/ --mode_train hard_seriali
 
 
 ### Step 2. Upstream into Pinecone
+> python upsert.py --recipes "ch2" --checkpoints "major-flower-62" --device "cuda:0"
 Set up [Pinecone](https://app.pinecone.io/organizations/-NUbbjSKn59kR22U_SS6/settings/projects), a cloud-hosted vector store. You will need to subscribe to the **Free > Standard** plan found [here](https://app.pinecone.io/organizations/-NUbbjSKn59kR22U_SS6/settings/billing/plans). But don't worry, you can always delete the store after you are done using it. Simply rerun this step to populate from scratch.
 
 Use: `upsert.py`. **Note**: You will need to change the `api_key` and `environment` variables in `pinecone_store.py` to get your upsert to work. Arguments:
@@ -43,7 +45,7 @@ python upsert.py --recipes "ch2;ch3;ch2,ch3" --checkpoints "trained-ch2-1000"
 Note for error `pinecone.core.exceptions.PineconeException: UNKNOWN:Error received from peer`: Due to the wait time of creating the pod on Pinecone, you may have to run this command more than once to start the upstream.
 
 ### Step 3a. Naïve Permutation and Accuracy Evaluation
-
+> python test_permute_fast.py --recipes "ch2" --checkpoints "major-flower-62" --generalize 25 --test_k 1000 --topk 50 --device "cuda:0"
 Ensure that Pinecone instances are running and the data is populated. Else go back to Step 2. To run permutation accuracy computations at scale, run `test_cache_permute.py`. Arguments:
 ```bash
 python test_permute.py 
@@ -69,6 +71,7 @@ See `test_clustering.py` and `test_clustering.ipynb`.
 
 
 ### Step 4. Accuracy Computation
+> python test_accuracy_fast.py --recipe "ch2" --checkpoints "major-flower-62" --test 10000 --system "MSv3" --device "cuda:0"
 Ensure that Pinecone instances are running and the data is populated. Else go back to Step 2. To run accuracy computations at scale, run `test_accuracy.py` or `test_accuracy_fast.py`. Arguments:
 ```bash
 python test_accuracy.py 
