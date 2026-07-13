@@ -18,6 +18,39 @@ import random
 import pickle
 from typing import Optional
 
+
+def _preload_matching_cublaslt():
+    """Pin faiss-gpu to the libcublasLt that matches its bundled libcublas.
+
+    The pip ``nvidia-cublas-cu12`` wheel ships matching ``libcublas.so.12`` and
+    ``libcublasLt.so.12``. A system CUDA on ``LD_LIBRARY_PATH`` (e.g.
+    ``/usr/local/cuda-*/lib64``) can shadow the wheel's ``libcublasLt`` with an
+    older build that lacks newer symbols, which makes ``import faiss`` fail with
+    an ``undefined symbol: cublasLtGetEnvironmentMode`` error. Loading the
+    wheel's own ``libcublasLt`` first with ``RTLD_GLOBAL`` forces the linker to
+    use the matching one. This is a no-op when the wheel is absent (CPU-only or
+    conda faiss builds), so it is always safe to run before importing faiss.
+    """
+    import ctypes
+    import glob
+
+    try:
+        import nvidia.cublas
+    except Exception:
+        return
+    lib_dir = os.path.join(os.path.dirname(nvidia.cublas.__file__), "lib")
+    for pattern in ("libcublasLt.so.12", "libcublasLt.so.*", "libcublasLt.so"):
+        matches = sorted(glob.glob(os.path.join(lib_dir, pattern)))
+        if matches:
+            try:
+                ctypes.CDLL(matches[0], mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                pass
+            return
+
+
+_preload_matching_cublaslt()
+
 import faiss
 import numpy as np
 from tqdm import tqdm
