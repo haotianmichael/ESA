@@ -1,4 +1,4 @@
-tokenizer: "/home/mahaotian/Dev/ESA/src/model/tokenizers/dna_tokenizer_10k.json"
+tokenizer: "/home/nfs/mahaotian/ESA/ESA/src/model/tokenizers/dna_tokenizer_10k.json"
 
 # initialized-with-one-step: "/mnt/SSD5/pholur/checkpoints/checkpoint_initalialized.pt"
 # trained-ch2-1000: "/mnt/SSD5/pholur/checkpoints/checkpoint_smooth-rock-29.pt"
@@ -17,6 +17,6 @@ tokenizer: "/home/mahaotian/Dev/ESA/src/model/tokenizers/dna_tokenizer_10k.json"
 #hyena-dna-mean: "Baseline"
 #hyena-dna-max: "Baseline"
 
-trained-chm13v2-0: "/home/mahaotian/Dev/ESA/model/checkpoint.pt"
-major-flower-62: "/home/mahaotian/Dev/Data/dnamodel/major-flower-62.pt"
-my_model: "/home/mahaotian/Dev/ESA/models/checkpoint.pt"
+trained-chm13v2-0: "/home/nfs/mahaotian/ESA/ESA/models/checkpoint.pt"
+major-flower-62: "/home/nfs/mahaotian/ESA/Data/dnamodel/major-flower-62.pt"
+my_model: "/home/nfs/mahaotian/ESA/ESA/models/checkpoint.pt"

@@ -114,7 +114,7 @@ class ContrastiveTrainer:
         
             if step % log_interval == 0:
                 current_lr = self.optimizer.param_groups[0]["lr"]
-                wandb.log({"loss": loss, "step": step, "lr": current_lr})
+                wandb.log({"loss": loss.item(), "step": step, "lr": current_lr})
 
             # save the model
             if loss < self.best_loss:

@@ -21,7 +21,7 @@ CONFIG = ConfigSchema(
         ),
     ),
     dataset_config=DatasetConfigSchemaUniformSampling(
-        fasta_file = [Path("/home/mahaotian/Dev/Data/chm13v2.0.fa")], 
+        fasta_file = [Path("/home/nfs/mahaotian/ESA/Data/chm13v2.0.fa")], 
         range_min = 800,
         range_max = 2000,
         subsequence_range_min = 80,

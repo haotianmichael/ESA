@@ -44,7 +44,7 @@ class PineconeStore:
         index_name = self._sanitize_index_name(index_name)
         
         if "config-" in index_name: # premium account
-            self.api_key = "pcsk_6YUeeT_Lba6F6sD3Vwo6RDqrgLj8bUqWem4vYbLSFvq73Pts9qyUM3m9boP6eAVMbFdjko"
+            self.api_key = "pcsk_5XDUCi_NXb4RHKsKqqueY4ULSjfiK4RGhvCjYNrx3kQkLcqFzzcrNLrTgPT3ypC72HGmde"
             self.environment = "us-east-1"
         else:
             raise NotImplementedError("Name not identified.")

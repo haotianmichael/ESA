@@ -14,5 +14,5 @@
 #ch23Y: "/mnt/SSD2/pholur/General_Models/data/chr23Y/floodfill.pkl"
 #
 #chM: "/mnt/SSD2/pholur/General_Models/data/chM/floodfill.pkl"
-ch2: "/home/mahaotian/Dev/Data/chromosome_2/floodfill.pkl"
-chY: "/home/mahaotian/Dev/Data/chromosome_Y/floodfill.pkl"
+ch2: "/home/nfs/mahaotian/ESA/Data/chromosome_2/floodfill.pkl"
+chY: "/home/nfs/mahaotian/ESA/Data/chromosome_Y/floodfill.pkl"

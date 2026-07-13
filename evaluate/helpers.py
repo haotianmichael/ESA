@@ -16,13 +16,13 @@ from collections import defaultdict
 import time
 
 
-with open("/home/mahaotian/Dev/ESA/evaluate/configs/data_recipes.yaml", 'r') as stream:
+with open("/home/nfs/mahaotian/ESA/ESA/evaluate/configs/data_recipes.yaml", 'r') as stream:
     data_recipes = yaml.safe_load(stream)
     
-with open("/home/mahaotian/Dev/ESA/evaluate/configs/model_checkpoints.yaml", 'r') as stream:
+with open("/home/nfs/mahaotian/ESA/ESA/evaluate/configs/model_checkpoints.yaml", 'r') as stream:
     checkpoints = yaml.safe_load(stream)
     
-with open("/home/mahaotian/Dev/ESA/evaluate/configs/raw.yaml", 'r') as stream:
+with open("/home/nfs/mahaotian/ESA/ESA/evaluate/configs/raw.yaml", 'r') as stream:
     raw_fasta_files = yaml.safe_load(stream)
 
 from tqdm import tqdm
