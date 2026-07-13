@@ -42,6 +42,9 @@ def main(paths:list,
          generalize: int = 5,
 ):
     
+    import os
+    os.makedirs("test_cache/permute", exist_ok=True)
+
     per_samples = test_k // len(paths)
     test_lines = []
     

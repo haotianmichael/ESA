@@ -1,3 +1,4 @@
+import os
 import random
 import yaml
 import numpy as np
@@ -213,6 +214,7 @@ def read_fasta_chromosomes(file_path):
     Yields:
         tuple: A tuple containing the chromosome header and sequence data.
     """
+    os.makedirs("test_cache/logs", exist_ok=True)
     with open(file_path, 'r') as file:
         header = None
         sequence = ''

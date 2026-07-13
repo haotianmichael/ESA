@@ -97,7 +97,10 @@ if __name__ == "__main__":
     now = datetime.now()
     formatted_date = now.strftime("%Y_%m_%d_%H_%M_%S")
 
-    logging.basicConfig(filename = Path(os.environ["DNA2VEC_CACHE_DIR"]) / "Logs" / f"log_{formatted_date}", 
+    os.makedirs(Path(os.environ["DNA2VEC_CACHE_DIR"]) / "Logs", exist_ok=True)
+    os.makedirs(Path(os.environ["DNA2VEC_CACHE_DIR"]) / "Results", exist_ok=True)
+
+    logging.basicConfig(filename = Path(os.environ["DNA2VEC_CACHE_DIR"]) / "Logs" / f"log_{formatted_date}",
                         level=logging.INFO)
     
     logging.info("Parameters:")

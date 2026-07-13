@@ -1,101 +1,159 @@
 ## Testbench for DNA-ESA
 
+This testbench takes you from a raw genome FASTA all the way to an **alignment
+accuracy** number, using a **local FAISS** vector store (no cloud / Pinecone
+account or API key required). The flow is:
+
+```
+Step 1  stage_upstream.py     FASTA  ->  floodfill.pkl  (+ test_cache/logs/headers)
+Step 2  upsert.py             pkl    ->  local FAISS index (evaluate/faiss_indexes/)
+Step 3  test_permute_fast.py  index  ->  permutation curves (test_cache/permute/*.npz)
+Step 4  test_accuracy_fast.py index  ->  accuracy CSV (Results/result_<timestamp>.csv)
+```
 
 ### Setup
-Ensure that your data folder `datapath` contains a subfolder for each section (in our case `chromosome_*`) and within each subfolder there is a `.fasta` file containing the genome (as a `string`) of that subsection.
 
-### Step 1. Collate the data to stage upstream into the local FAISS store
-> python stage_upstream.py --datapath ../../Data/data/chromosome_2/ --mode_train hard_serialized --rawfile chr2.fasta --unit_length 1000 --meta CH2 --overlap 200 --topath floodfill.pkl --ntrain 500000
-Use: `stage_upstream.py`. Arguments:
+1. **Install dependencies.** From the repo root: `pip install -e .` This pulls
+   in `torch`, `sentence-transformers`, `faiss`, etc. For GPU-accelerated search
+   install the GPU build of FAISS (`pip install faiss-gpu`, or `conda install -c
+   pytorch -c nvidia faiss-gpu`); otherwise `faiss-cpu` is used and everything
+   still works. Step 4 additionally needs the **ART read simulator** (used by
+   `dna2vec.simulate.simulate_mapped_reads`).
+
+2. **Point the config files at your data.** All three live under `configs/`:
+   - `configs/data_recipes.yaml` — maps a recipe alias (e.g. `ch2`) to the
+     `floodfill.pkl` produced in Step 1.
+   - `configs/raw.yaml` — maps a recipe alias to the source `.fasta` (used by
+     Step 4 to simulate reads).
+   - `configs/model_checkpoints.yaml` — maps a checkpoint alias to a trained
+     `.pt` file, plus the `tokenizer` path.
+
+3. **Data layout.** Ensure your data folder contains a subfolder per section
+   (e.g. `chromosome_*`), each with a `.fasta` file holding the genome of that
+   subsection.
+
+> **GPU note:** Search runs on the GPU (exact `IndexFlatIP` flat search — fast
+> and lossless) whenever `--device` is a CUDA device and `faiss-gpu` is
+> installed, and falls back to CPU transparently otherwise. The model encoder
+> always runs on the `--device` you pass.
+
+### Step 1. Collate the data into an upstream `.pkl`
+
 ```bash
-python stage_upstream 
-    --datapath <path_to_data>           % path to subfolders
-    --mode_train <train_mode>           % how to parse the FASTA file
-    --rawfile <raw_file>                % source FASTA file
-    --unit_length <length>              % length of grounded fragment
+python stage_upstream.py --datapath data/chromosome_2/ --mode_train hard_serialized \
+    --rawfile chr2.fasta --unit_length 1000 --meta CH2 --overlap 200 \
+    --topath floodfill.pkl --ntrain 500000
+```
+Arguments:
+```bash
+python stage_upstream.py
+    --datapath <path_to_data>           % path to the chromosome subfolder
+    --mode_train <train_mode>           % how to parse the FASTA file (hard_serialized)
+    --rawfile <raw_file>                % source FASTA file inside datapath
+    --unit_length <length>              % length of each grounded fragment
     --meta <meta_data>                  % identifier string
     --overlap <overlap_value>           % overlap between fragments
-    --topath <output_path>              % name of upstream file
-    --ntrain <num_train>                % max limit of fragments
-
+    --topath <output_path>              % name of the output .pkl (written into datapath)
+    --ntrain <num_train>                % max number of fragments
 ```
-
-For example:
-```bash
-python stage_upstream.py --datapath data/chromosome_2/ --mode_train hard_serialized --rawfile NC_000002.fasta --unit_length 1000 --meta CH2 --overlap 200 --topath floodfill.pkl --ntrain 500000
-```
-
-
+This writes `<datapath>/<topath>` (the `floodfill.pkl` referenced by
+`configs/data_recipes.yaml`) and appends the FASTA headers to
+`test_cache/logs/headers` (needed by Step 4). Make `configs/data_recipes.yaml`'s
+`ch2` entry point at the `.pkl` you just wrote.
 
 ### Step 2. Upstream into the local FAISS store
-> python upsert.py --recipes "ch2" --checkpoints "major-flower-62" --device "cuda:0"
-Vectors are stored locally with [FAISS](https://github.com/facebookresearch/faiss) — no cloud account or API key is required. Search runs on the **GPU** (exact `IndexFlatIP` flat search — fast and lossless) whenever the `--device` is a CUDA device and `faiss-gpu` is installed, and falls back to CPU transparently otherwise. Each index is persisted to disk under `evaluate/faiss_indexes/<index_name>/` (override the base directory with the `FAISS_INDEX_DIR` environment variable). You can always delete the store after you are done using it (see `drop_table`); simply rerun this step to populate from scratch.
 
-Use: `upsert.py`. The FAISS backend lives in `faiss_store.py`; `pinecone_store.py` is kept as a thin compatibility shim that re-exports it as `PineconeStore`. Arguments:
 ```bash
-python upsert.py 
-    --recipes <str list of aliases or paths to data dumps (.pkl)> 
+python upsert.py --recipes "ch2" --checkpoints "major-flower-62" --device "cuda:0"
+```
+Vectors are embedded with the checkpoint's encoder and stored locally with
+[FAISS](https://github.com/facebookresearch/faiss). The index is persisted to
+`evaluate/faiss_indexes/config-<checkpoint>-<recipe>/` (override the base
+directory with the `FAISS_INDEX_DIR` environment variable). Rerun this step any
+time to repopulate from scratch; `drop_table()` deletes an index.
+
+Arguments:
+```bash
+python upsert.py
+    --recipes <str list of aliases or paths to data dumps (.pkl)>
     --checkpoints <str list of model checkpoints>
+    --device <gpu, e.g. cuda:0>
 ```
-List delimiters are semicolons (`;`). Also you can concatenate datastores by using the comma (`,`).
-For example:
+List delimiters are semicolons (`;`); concatenate datastores into one index with
+commas (`,`). For example:
 ```bash
-python upsert.py --recipes "ch2;ch3;ch2,ch3" --checkpoints "trained-ch2-1000"
+python upsert.py --recipes "ch2;ch3;ch2,ch3" --checkpoints "trained-ch2-1000" --device "cuda:0"
 ```
 
-### Step 3a. Naïve Permutation and Accuracy Evaluation
-> python test_permute_fast.py --recipes "ch2" --checkpoints "major-flower-62" --generalize 25 --test_k 1000 --topk 50 --device "cuda:0"
-Ensure that the local FAISS index has been populated. Else go back to Step 2. To run permutation accuracy computations at scale, run `test_cache_permute.py`. Arguments:
+The FAISS backend lives in `faiss_store.py`; `pinecone_store.py` is kept as a
+thin compatibility shim that re-exports it as `PineconeStore`, so every
+downstream script keeps working unchanged.
+
+### Step 3. Naïve Permutation and Accuracy Evaluation
+
 ```bash
-python test_permute.py 
+python test_permute_fast.py --recipes "ch2" --checkpoints "major-flower-62" \
+    --generalize 25 --test_k 1000 --topk 50 --device "cuda:0"
+```
+Ensure the local FAISS index has been populated (Step 2). Arguments:
+```bash
+python test_permute_fast.py
     --recipes               % <data recipe combinations>
     --checkpoints           % <model checkpoint>
-    --mode                  % <permutation mode>
     --generalize            % <smoothing factor>
     --test_k                % <number of samples>
-    --topk                  % <set of topks>
+    --topk                  % <set of topks, ';'-delimited>
     --device                % <gpu>
 ```
-The additional argument `mode` specifies the type of permutation that is applied on the sequence.For example:
+For example:
 ```bash
-python test_permute.py --recipes "all" --checkpoints "trained-all-longer" --mode "random_sub" --generalize 25 --test_k 1000 --topk 5;25;50 --device "cuda:1"
-
-python test_permute_fast.py --recipes "all" --checkpoints "trained-all-longer" --generalize 25 --test_k 1000 --topk 5;25;50 --device "cuda:1"
+python test_permute_fast.py --recipes "all" --checkpoints "trained-all-longer" \
+    --generalize 25 --test_k 1000 --topk "5;25;50" --device "cuda:1"
 ```
+Results are written to `test_cache/permute/run_*.npz`; visualize them with
+`test_permutes.ipynb`.
 
-Results corresponding to these evaluations are deposited in `DATA_PATH`. You can visualize the results of these evaluations using the testbench `test_permutes.ipynb`.
+#### Manifold Visualization
+See `others/test_clustering.py` and `test_alignment.ipynb`.
 
-### Step 3b. Manifold Visualization
-See `test_clustering.py` and `test_clustering.ipynb`.
+### Step 4. Accuracy Computation (final accuracy)
 
-
-### Step 4. Accuracy Computation
-> python test_accuracy_fast.py --recipe "ch2" --checkpoints "major-flower-62" --test 10000 --system "MSv3" --device "cuda:0"
-Ensure that the local FAISS index has been populated. Else go back to Step 2. To run accuracy computations at scale, run `test_accuracy.py` or `test_accuracy_fast.py`. Arguments:
 ```bash
-python test_accuracy.py 
-    --recipes               % <data recipe combinations>
+python test_accuracy_fast.py --recipe "ch2" --checkpoints "major-flower-62" \
+    --test 10000 --system "MSv3" --device "cuda:0"
+```
+This simulates reads with ART, aligns them through the FAISS index, and writes
+the **accuracy** to `Results/result_<timestamp>.csv` (the last column,
+`Accuracy`, is the alignment accuracy per grid configuration). Prerequisites:
+
+- The FAISS index from Step 2 must exist.
+- `test_cache/logs/headers` from Step 1 must exist (it maps simulated-read IDs
+  back to chromosome headers).
+- `configs/raw.yaml` must point `ch2` at the source FASTA.
+
+Arguments:
+```bash
+python test_accuracy_fast.py
+    --recipe                % <data recipe>
     --checkpoints           % <model checkpoint>
-    --test_k                % <number of samples>
-    --system                % <ART read generation system>
+    --test                  % <number of simulated reads per amplicon>
+    --system                % <ART read-generation system, e.g. MSv3>
     --device                % <gpu>
 ```
-
-Modify the parameter grid in `test_accuracy.py` and example commands are below:
-```bash
-python test_accuracy.py --recipe "ch2" --checkpoints "trained-ch2-1000" --test 5000 --system "MSv3"
-
-python test_accuracy_fast.py --recipe "all" --checkpoints "trained-all_longer" --test 10000 --system "MSv3" 
-```
+The parameter sweep (read length, insertion/deletion rate, quality, top-k, …)
+is defined by the `grid` dict at the top of `test_accuracy_fast.py`; edit it to
+change what gets evaluated. Each grid row becomes one line in the results CSV.
 
 ## Setting up reference baselines
 
 ### Transformer-based DNA Encoders
-*To add a new baseline:* All the permute `test_permute.py`, `test_permute_fast.py` and accuracy scripts `test_accuracy.py`, `test_accuracy_fast.py` accept checkpoints that are defined in the following paths: `configs/model_checkpoints.yaml` contains `keyword: Baseline`. 
+*To add a new baseline:* the permute/accuracy scripts accept checkpoints defined
+in `configs/model_checkpoints.yaml` with the value `Baseline`. As with
+`DNA-ESA`, the encode functionality must specify the featurization process; see
+`inference_models.py` for details.
 
-Similar to `DNA-ESA`, encode functionality must specify the featurization process. See `inference_models.py` for details.
-
-Note: Ensure that the local FAISS store is populated with the related vectors prior to running tests.
+Note: Ensure the local FAISS store is populated with the related vectors prior
+to running tests.
 
 
 ### Conventional Methods
