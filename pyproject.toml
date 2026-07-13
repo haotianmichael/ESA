@@ -28,7 +28,7 @@ dependencies = [
     "sentence-transformers>=2.2.0",
     "umap-learn>=0.1.1",
     "tqdm>=4.62.0",
-    "pinecone[grpc]>2.2.0",
+    "faiss-cpu>=1.7.0",
     "pydantic>=1.8.2,<2.0.0",
     "typer>=0.3.2",
     "tokenizers>=0.13.3",

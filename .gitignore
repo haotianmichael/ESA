@@ -34,3 +34,7 @@ data/*
 
 *.tgz
 art*
+
+# local FAISS vector store
+faiss_indexes/
+evaluate/faiss_indexes/
