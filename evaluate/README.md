@@ -29,7 +29,7 @@ python stage_upstream.py --datapath data/chromosome_2/ --mode_train hard_seriali
 
 ### Step 2. Upstream into the local FAISS store
 > python upsert.py --recipes "ch2" --checkpoints "major-flower-62" --device "cuda:0"
-Vectors are stored locally with [FAISS](https://github.com/facebookresearch/faiss) — no cloud account or API key is required. Each index is persisted to disk under `evaluate/faiss_indexes/<index_name>/` (override the base directory with the `FAISS_INDEX_DIR` environment variable). You can always delete the store after you are done using it (see `drop_table`); simply rerun this step to populate from scratch.
+Vectors are stored locally with [FAISS](https://github.com/facebookresearch/faiss) — no cloud account or API key is required. Search runs on the **GPU** (exact `IndexFlatIP` flat search — fast and lossless) whenever the `--device` is a CUDA device and `faiss-gpu` is installed, and falls back to CPU transparently otherwise. Each index is persisted to disk under `evaluate/faiss_indexes/<index_name>/` (override the base directory with the `FAISS_INDEX_DIR` environment variable). You can always delete the store after you are done using it (see `drop_table`); simply rerun this step to populate from scratch.
 
 Use: `upsert.py`. The FAISS backend lives in `faiss_store.py`; `pinecone_store.py` is kept as a thin compatibility shim that re-exports it as `PineconeStore`. Arguments:
 ```bash

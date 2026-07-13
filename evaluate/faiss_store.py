@@ -85,9 +85,59 @@ class FaissStore:
         self.persist_dir = persist_dir or _default_index_dir()
         self.index_path = os.path.join(self.persist_dir, index_name)
 
+        self._init_gpu(device)
+
         # namespace -> {"index": faiss.Index, "metadata": list[dict]}
         self.namespaces = {}
         self._load()
+
+    # ------------------------------------------------------------------ #
+    # GPU helpers
+    # ------------------------------------------------------------------ #
+    def _init_gpu(self, device):
+        """Enable GPU-backed search when a CUDA device and faiss-gpu are present.
+
+        Falls back to CPU transparently so the store still works with faiss-cpu
+        or when no GPU is available.
+        """
+        self._gpu_id = 0
+        self._gpu_resources = None
+        self.use_gpu = False
+
+        device_str = str(device)
+        if "cuda" not in device_str:
+            return
+        if ":" in device_str:
+            try:
+                self._gpu_id = int(device_str.split(":")[-1])
+            except ValueError:
+                self._gpu_id = 0
+
+        gpu_available = (
+            hasattr(faiss, "StandardGpuResources")
+            and getattr(faiss, "get_num_gpus", lambda: 0)() > 0
+        )
+        if not gpu_available:
+            return
+        if self._gpu_id >= faiss.get_num_gpus():
+            self._gpu_id = 0
+        self._gpu_resources = faiss.StandardGpuResources()
+        self.use_gpu = True
+
+    def _to_gpu(self, index):
+        if not self.use_gpu:
+            return index
+        return faiss.index_cpu_to_gpu(self._gpu_resources, self._gpu_id, index)
+
+    @staticmethod
+    def _to_cpu(index):
+        """Return a CPU copy of a (possibly GPU-resident) index for saving."""
+        if hasattr(faiss, "index_gpu_to_cpu") and hasattr(index, "getDevice"):
+            try:
+                return faiss.index_gpu_to_cpu(index)
+            except Exception:
+                return index
+        return index
 
     # ------------------------------------------------------------------ #
     # Naming / persistence helpers
@@ -107,9 +157,12 @@ class FaissStore:
 
     def _new_index(self) -> faiss.Index:
         if self.metric == "l2" or self.metric == "euclidean":
-            return faiss.IndexFlatL2(self.dimension)
-        # cosine (normalized) and dotproduct both use inner product.
-        return faiss.IndexFlatIP(self.dimension)
+            index = faiss.IndexFlatL2(self.dimension)
+        else:
+            # cosine (normalized) and dotproduct both use inner product.
+            index = faiss.IndexFlatIP(self.dimension)
+        # Exact flat search on GPU: fast and lossless for this data scale.
+        return self._to_gpu(index)
 
     def _get_or_create_namespace(self, namespace: str):
         entry = self.namespaces.get(namespace)
@@ -130,14 +183,20 @@ class FaissStore:
         self._higher_is_better = self.metric in ("cosine", "dotproduct")
         for ns, info in saved["namespaces"].items():
             index = faiss.read_index(os.path.join(self.index_path, info["file"]))
-            self.namespaces[ns] = {"index": index, "metadata": info["metadata"]}
+            self.namespaces[ns] = {
+                "index": self._to_gpu(index),
+                "metadata": info["metadata"],
+            }
 
     def _save(self):
         os.makedirs(self.index_path, exist_ok=True)
         namespaces_meta = {}
         for i, (ns, entry) in enumerate(self.namespaces.items()):
             file_name = f"ns_{i}.faiss"
-            faiss.write_index(entry["index"], os.path.join(self.index_path, file_name))
+            faiss.write_index(
+                self._to_cpu(entry["index"]),
+                os.path.join(self.index_path, file_name),
+            )
             namespaces_meta[ns] = {"file": file_name, "metadata": entry["metadata"]}
         with open(os.path.join(self.index_path, "store.pkl"), "wb") as f:
             pickle.dump(
