@@ -38,18 +38,32 @@ def _preload_matching_cublaslt():
         import nvidia.cublas
     except Exception:
         return
-    lib_dir = os.path.join(os.path.dirname(nvidia.cublas.__file__), "lib")
-    for pattern in ("libcublasLt.so.12", "libcublasLt.so.*", "libcublasLt.so"):
-        matches = sorted(glob.glob(os.path.join(lib_dir, pattern)))
-        if matches:
-            try:
-                ctypes.CDLL(matches[0], mode=ctypes.RTLD_GLOBAL)
-            except OSError:
-                pass
-            return
+
+    # ``nvidia.cublas`` is typically a PEP 420 namespace package, so ``__file__``
+    # may be None; fall back to ``__path__`` (a list of directories).
+    base_dirs = []
+    module_file = getattr(nvidia.cublas, "__file__", None)
+    if module_file:
+        base_dirs.append(os.path.dirname(module_file))
+    base_dirs.extend(list(getattr(nvidia.cublas, "__path__", []) or []))
+
+    for base in base_dirs:
+        lib_dir = os.path.join(base, "lib")
+        for pattern in ("libcublasLt.so.12", "libcublasLt.so.*", "libcublasLt.so"):
+            matches = sorted(glob.glob(os.path.join(lib_dir, pattern)))
+            if matches:
+                try:
+                    ctypes.CDLL(matches[0], mode=ctypes.RTLD_GLOBAL)
+                except OSError:
+                    pass
+                return
 
 
-_preload_matching_cublaslt()
+try:
+    _preload_matching_cublaslt()
+except Exception:
+    # Best-effort only: never let the preload shim block importing faiss.
+    pass
 
 import faiss
 import numpy as np
