@@ -39,8 +39,14 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-  "ruff>=0.0.261", 
+  "ruff>=0.0.261",
   "black[jupyter]>=23.3.0",
+]
+signal = [
+  "mamba-ssm>=2.0.0",
+  "causal-conv1d>=1.2.0",
+  "pyslow5>=1.0.0",
+  "fastdtw>=0.3.4",
 ]
 tests = [
   "pytest>=7.1.2",

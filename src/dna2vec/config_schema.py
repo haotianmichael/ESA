@@ -109,3 +109,37 @@ class ConfigSchema(BaseModel):
     dataset_config: BaseDatasetConfigSchema = DatasetConfigSchema()
 
 
+# --------------------------------------------------------------------------- #
+# Signal-domain (learned RawHash) configuration
+#
+# Additive schema for the signal-seeding pilot. It mirrors the field style of
+# ModelConfigSchema so the existing Optimizer/Scheduler/Training schemas can be
+# reused verbatim. The pooler defaults to the same parameter-free AveragePooler.
+# --------------------------------------------------------------------------- #
+class SignalModelConfigSchema(BaseModel):
+    encoder_type: Literal["mamba", "transformer", "cnn_rnn"] = "mamba"
+
+    # Conv front-end
+    conv_channels_1: int = 64
+    conv_channels_2: int = 512
+    conv_kernel_1: int = 11
+    downsample_factor: int = 5  # stride of the second (down-sampling) conv
+
+    # Sequence encoder body
+    n_mamba_blocks: int = 6
+    d_state: int = 128
+    d_conv: int = 4
+    expand: int = 2
+    num_heads: int = 6  # transformer fallback only
+    dropout: float = 0.1
+
+    # I/O
+    input_signal_len: int = 2000  # samples per window (must be divisible by downsample_factor)
+    embedding_dim: int = 384
+    pooling: nn.Module = AveragePooler()
+    model_path: Optional[Path] = None
+
+    class Config:
+        arbitrary_types_allowed = True
+
+

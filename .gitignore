@@ -41,3 +41,7 @@ evaluate/faiss_indexes/
 simulated_reads/
 Logs/
 Results/
+
+# signal-domain pilot artifacts
+evaluate/signal_checkpoints/
+simulated_signals/
