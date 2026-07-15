@@ -1,5 +1,5 @@
 import os
-os.environ["DNA2VEC_CACHE_DIR"] = "/home/nfs/mahaotian/ESA/ESA"
+os.environ["DNA2VEC_CACHE_DIR"] = "/home/nfs/mahaotian/ESA/FAISS_ESA"
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
@@ -86,7 +86,7 @@ def control_meta_map(path):
 
 if __name__ == "__main__":
     
-    meta_data_map = control_meta_map("/home/nfs/mahaotian/ESA/ESA/evaluate/test_cache/logs/headers")
+    meta_data_map = control_meta_map("/home/nfs/mahaotian/ESA/FAISS_ESA/evaluate/test_cache/logs/headers")
     
     args = parser.parse_args()
     fasta_file_path = raw_fasta_files[args.recipe]

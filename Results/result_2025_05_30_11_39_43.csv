@@ -1,8 +1,0 @@
-# recipe: ch2
-# checkpoints: my_model
-# topk: None
-# test: 10000
-# system: MSv3
-# device: cuda:0
-Quality,Read length,Insertion rate,Deletion rate,TopK,Distance bound,Exactness,Accuracy
-(30; 60),250,0.01,0.01,75,15,2,0.9721
