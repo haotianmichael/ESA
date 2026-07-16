@@ -76,6 +76,7 @@ class SignalPairDataset(IterableDataset):
         query_coords: List[int],
         reference_seq: str,
         pore_model,
+        unit_length: int,
         input_signal_len: int = 2000,
         downsample_factor: int = 5,
         samples_per_kmer: int = 9,
@@ -88,8 +89,11 @@ class SignalPairDataset(IterableDataset):
         self.pore_model = pore_model
         self.input_signal_len = input_signal_len
         self.downsample_factor = downsample_factor
-        # bases needed so the expected signal spans ~input_signal_len samples
-        self.win_bp = input_signal_len // max(1, samples_per_kmer) + pore_model.kmer_len
+        # The training reference span MUST equal the index window span
+        # (``unit_length``) — otherwise the encoder learns to match a reference
+        # vector length that does not exist in the FAISS index, and the true
+        # window is pushed out of the top-k (recall can drop below random).
+        self.win_bp = unit_length
 
     def _pair(self, idx: int) -> Tuple[Dict, Dict]:
         coord = int(self.query_coords[idx])

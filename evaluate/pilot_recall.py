@@ -184,6 +184,16 @@ def train_encoder(encoder, pooling, dataset, device, args):
 
     wandb.init(mode="disabled")
 
+    # Make training loss visible WITHOUT forking trainer.py: ContrastiveTrainer
+    # only reports via wandb.log(...), and wandb is disabled here, so route that
+    # call to stdout. This preserves the "trainer.py unchanged" reuse guarantee
+    # while letting us tell "not learning" apart from "learned but misaligned".
+    def _stdout_log(d, *a, **k):
+        if isinstance(d, dict) and "loss" in d:
+            print(f"[train] step {d.get('step', '?')} loss {d['loss']:.4f} "
+                  f"lr {d.get('lr', float('nan')):.2e}", flush=True)
+    wandb.log = _stdout_log
+
     dataloader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=signal_collate)
     optimizer = torch.optim.Adam(encoder.parameters(), lr=args.lr)
     scheduler = OneCycleLR(optimizer, max_lr=args.lr, total_steps=args.train_steps + 1)
@@ -288,6 +298,7 @@ def main():
         query_signals=[r.signal for r in train_reads],
         query_coords=[r.reference_start for r in train_reads],
         reference_seq=reference_seq, pore_model=pore_model,
+        unit_length=args.unit_length,
         input_signal_len=args.input_signal_len, downsample_factor=args.downsample_factor,
         samples_per_kmer=args.samples_per_kmer,
     )

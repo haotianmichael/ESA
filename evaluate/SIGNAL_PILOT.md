@@ -97,8 +97,30 @@ installed versions:
 - **pore-model table format** (`pore_model.py`): parser expects `<kmer> <level>`
   columns and skips headers; verify against your table's layout.
 
+### Span invariant + loss visibility
+
+Two things that otherwise silently kill recall:
+
+- **Span invariant:** the training reference span equals the index window span
+  (`SignalPairDataset(unit_length=...)` uses `win_bp = unit_length`). If they
+  differ, the encoder is trained to match a reference vector length that does
+  not exist in the index and recall can fall *below* random.
+- **Loss visibility:** `ContrastiveTrainer` only logs via `wandb.log` (disabled
+  here). The pilot routes that to stdout (`[train] step .. loss .. lr ..`)
+  without editing `trainer.py`, so you can tell "not learning" (loss flat) from
+  "learned but misaligned" (loss drops, recall still low).
+
 ## If M0 is NO-GO
 
-Per the plan: try query-side augmentation, or inject simulated noise on the
-reference side (squigulator noise presets) to shrink the domain gap, before
-abandoning. Do **not** build M1 until M0 passes.
+First read the loss:
+
+- **loss drops + recall rises** → GO, proceed to M1.
+- **loss drops, recall ≈ 0** → real domain gap (clean vs noisy + fixed dwell vs
+  variable dwell time-warp). Only now tune training: more `--train_steps`,
+  higher `--lr`, near-position hard negatives, denser tiling
+  (`--overlap 285`), or a small squigulator `--dwell-std` probe to test whether
+  time-warp is the wall.
+- **loss flat** → training-side problem (pairs/lr/optimizer); fix that first.
+
+Do **not** tune training hyperparameters before the loss is visible, and do
+**not** build M1 until M0 passes.
