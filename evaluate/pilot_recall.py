@@ -65,10 +65,14 @@ def parse_args():
     p.add_argument("--samples_per_kmer", type=int, default=9)
     p.add_argument("--device", type=str, default="cuda:0")
 
-    p.add_argument("--ref_bp", type=int, default=1_000_000,
-                   help="Truncate the reference to this many bp for the pilot (0 = full).")
+    p.add_argument("--ref_bp", type=int, default=0,
+                   help="Truncate the reference to this many bp for the pilot (0 = full genome). "
+                        "The SAME truncated sequence is fed to squigulator, so coordinates stay aligned.")
     p.add_argument("--unit_length", type=int, default=300)
     p.add_argument("--overlap", type=int, default=150)
+    p.add_argument("--forward_only", type=int, default=1,
+                   help="1 = keep only '+'-strand reads (forward-only index). M0 default; "
+                        "strand-aware dual-index is M1.")
 
     p.add_argument("--n_train", type=int, default=20000)
     p.add_argument("--n_query", type=int, default=2000)
@@ -124,7 +128,18 @@ def build_store(signal_model, name, device, reference_seq, pore_model, args):
     return store
 
 
-def evaluate_recall(store, eval_reads, topk_list, tol_bp):
+def _covers(coord, true_coord, unit_length, tol_bp):
+    """A retrieved window is correct if its interval covers the read's start.
+
+    Interval-coverage (with small tol slack) is the semantically right hit
+    criterion: under overlapping tiling every genomic position is covered by at
+    least one window, so a perfect encoder can reach ~100% recall — unlike a
+    point-distance criterion, whose ceiling is tol/stride.
+    """
+    return (coord - tol_bp) <= true_coord < (coord + unit_length + tol_bp)
+
+
+def evaluate_recall(store, eval_reads, topk_list, tol_bp, unit_length):
     signals = [r.signal for r in eval_reads]
     coords = [r.reference_start for r in eval_reads]
     max_k = max(topk_list)
@@ -135,7 +150,7 @@ def evaluate_recall(store, eval_reads, topk_list, tol_bp):
         true_coord = res["index"]
         cand = [m["metadata"]["coord"] for m in res["matches"]]
         for k in topk_list:
-            if any(abs(c - true_coord) <= tol_bp for c in cand[:k]):
+            if any(_covers(c, true_coord, unit_length, tol_bp) for c in cand[:k]):
                 hits[k] += 1
     n = len(eval_reads)
     return {k: hits[k] / n for k in topk_list}
@@ -150,7 +165,7 @@ def evaluate_random(reference_len, eval_reads, unit_length, overlap, topk_list, 
     for r in eval_reads:
         picks = rng.choice(starts, size=min(max_k, len(starts)), replace=False)
         for k in topk_list:
-            if any(abs(int(c) - r.reference_start) <= tol_bp for c in picks[:k]):
+            if any(_covers(int(c), r.reference_start, unit_length, tol_bp) for c in picks[:k]):
                 hits[k] += 1
     n = len(eval_reads)
     return {k: hits[k] / n for k in topk_list}
@@ -189,17 +204,32 @@ def train_encoder(encoder, pooling, dataset, device, args):
     return encoder
 
 
-def simulate_reads(args, reference_seq, pore_model, n_reads, seed, tag):
+def write_single_record_fasta(seq, path):
+    """Write ``seq`` as a single-record FASTA so squigulator's coordinates map
+    directly onto our in-memory ``reference_seq`` (fixes the truncation /
+    multi-record coordinate mismatch)."""
+    with open(path, "w") as f:
+        f.write(">ref\n")
+        for i in range(0, len(seq), 80):
+            f.write(seq[i : i + 80] + "\n")
+    return path
+
+
+def simulate_reads(args, reference_seq, pore_model, n_reads, seed, tag, squig_fasta):
     if args.use_synthetic:
-        return simulate_synthetic_signals(
+        reads = simulate_synthetic_signals(
             reference_seq=reference_seq, pore_model=pore_model,
             n_reads=n_reads, read_length_bp=args.read_length_bp, seed=seed,
         )
-    return simulate_mapped_signals(
-        reference_genome=args.reference_fasta, n_reads=n_reads,
-        read_length_bp=args.read_length_bp, profile=args.squigulator_profile,
-        seed=seed,
-    )
+    else:
+        reads = simulate_mapped_signals(
+            reference_genome=squig_fasta, n_reads=n_reads,
+            read_length_bp=args.read_length_bp, profile=args.squigulator_profile,
+            seed=seed,
+        )
+    if args.forward_only:
+        reads = [r for r in reads if r.strand == "+"]
+    return reads
 
 
 def print_table(name, recall, topk_list):
@@ -227,10 +257,18 @@ def main():
         reference_seq = reference_seq[: args.ref_bp]
     print(f"[info] reference length = {len(reference_seq)} bp; device = {device}")
 
+    # Feed squigulator the EXACT sequence we index, as a single record, so its
+    # PAF coordinates align with our reference_seq (fixes the coord-frame bug).
+    import tempfile
+    squig_fasta = write_single_record_fasta(
+        reference_seq, os.path.join(tempfile.mkdtemp(prefix="pilot_ref_"), "ref.fasta")
+    )
+
     # Query reads: disjoint train / eval sets.
-    train_reads = simulate_reads(args, reference_seq, pore_model, args.n_train, args.seed, "train")
-    eval_reads = simulate_reads(args, reference_seq, pore_model, args.n_query, args.seed + 1, "eval")
-    print(f"[info] simulated {len(train_reads)} train / {len(eval_reads)} eval reads")
+    train_reads = simulate_reads(args, reference_seq, pore_model, args.n_train, args.seed, "train", squig_fasta)
+    eval_reads = simulate_reads(args, reference_seq, pore_model, args.n_query, args.seed + 1, "eval", squig_fasta)
+    print(f"[info] simulated {len(train_reads)} train / {len(eval_reads)} eval reads "
+          f"(forward_only={bool(args.forward_only)})")
 
     # --- random baseline ---
     rec_random = evaluate_random(
@@ -242,7 +280,7 @@ def main():
     untrained_model, _ = make_signal_model(args, device)
     store_u = build_store(untrained_model, "signal-pilot-untrained", device,
                           reference_seq, pore_model, args)
-    rec_untrained = evaluate_recall(store_u, eval_reads, topk_list, args.tol_bp)
+    rec_untrained = evaluate_recall(store_u, eval_reads, topk_list, args.tol_bp, args.unit_length)
 
     # --- trained encoder ---
     trained_model, cfg = make_signal_model(args, device)
@@ -259,7 +297,7 @@ def main():
     trained_model.encoder = trained_encoder
     store_t = build_store(trained_model, "signal-pilot-trained", device,
                           reference_seq, pore_model, args)
-    rec_trained = evaluate_recall(store_t, eval_reads, topk_list, args.tol_bp)
+    rec_trained = evaluate_recall(store_t, eval_reads, topk_list, args.tol_bp, args.unit_length)
 
     # --- report ---
     print("\n================ M0 recall (tol +/-%dbp) ================" % args.tol_bp)

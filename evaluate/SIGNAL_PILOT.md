@@ -50,9 +50,11 @@ Then obtain two external artifacts (neither is bundled):
 Real go/no-go (recommended):
 ```bash
 python evaluate/pilot_recall.py \
-    --reference_fasta /path/to/single_record.fasta \
+    --reference_fasta /path/to/genome.fasta \
     --pore_model /path/to/r9.4_6mer.model \
-    --device cuda:0 --train_steps 2000
+    --device cuda:0 --train_steps 3000 \
+    --input_signal_len 3000 --tol_bp 15
+    # note: do NOT pass --ref_bp (defaults to full genome; see coordinate alignment below)
 ```
 
 Plumbing smoke-test (no squigulator / no pore-model table — synthetic, **not a
@@ -63,6 +65,25 @@ python evaluate/pilot_recall.py --reference_fasta /path/to/ref.fasta --use_synth
 
 Output is a recall@{1,5,10,50} table for **random / untrained / trained**. The
 go/no-go criterion is `trained > untrained > random` (checked at @10).
+
+### Real-path correctness (three fixes baked in)
+
+The real (squigulator) path has three ways to silently read 0% that the
+synthetic path bypasses; all are handled:
+
+1. **Coordinate alignment.** squigulator reads the whole FASTA, so truncating
+   the in-memory reference would desync coordinates. The pilot writes the exact
+   sequence it indexes (optionally truncated via `--ref_bp`) as a single-record
+   FASTA and feeds *that* to squigulator, so PAF coordinates map onto the index.
+   `--ref_bp` defaults to `0` (full genome).
+2. **Strand.** squigulator emits ~50% reverse-strand reads whose signal is the
+   reverse-complement waveform; against a forward-only index they cannot match.
+   Strand is parsed from the PAF and, by default (`--forward_only 1`), only `+`
+   reads are kept. (Strand-aware dual-strand indexing is an M1 item.)
+3. **Hit criterion.** With `unit_length=300, overlap=150` (stride 150) a
+   point-distance `±tol_bp` criterion caps recall at ~`tol/stride` (~20%). The
+   pilot instead uses **interval coverage** — a window is correct if it covers
+   the read start — so overlapping tiling admits a ~100% ceiling.
 
 ## Two integration points to confirm on your machine
 

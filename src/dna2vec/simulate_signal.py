@@ -27,9 +27,10 @@ import numpy as np
 @dataclass
 class SignalReadAndRef:
     signal: np.ndarray          # 1-D raw/pA current samples
-    reference_start: int        # ground-truth genomic start (bp)
+    reference_start: int        # ground-truth genomic start (bp, forward-strand coord)
     id: str
     reference_name: Optional[str] = None
+    strand: str = "+"           # '+' or '-' (PAF column 5)
 
 
 # --------------------------------------------------------------------------- #
@@ -90,28 +91,34 @@ def simulate_mapped_signals(
         rid = read["read_id"]
         if rid not in coords:
             continue
-        tstart, tname = coords[rid]
+        tstart, tname, strand = coords[rid]
         reads.append(
             SignalReadAndRef(
                 signal=np.asarray(read["signal"], dtype=np.float32),
                 reference_start=int(tstart),
                 id=str(rid),
                 reference_name=tname,
+                strand=strand,
             )
         )
     return reads
 
 
 def _parse_paf_coords(paf_path: str) -> dict:
-    """read_id -> (target_start, target_name) from a PAF file."""
+    """read_id -> (target_start, target_name, strand) from a PAF file.
+
+    PAF columns (0-based): 0 qname, 4 strand, 5 tname, 7 target_start. Target
+    coordinates are always on the forward strand; a '-' read's bases are the
+    reverse complement of ``reference[tstart:tend]``.
+    """
     coords = {}
     with open(paf_path, "r") as f:
         for line in f:
             parts = line.rstrip("\n").split("\t")
             if len(parts) < 9:
                 continue
-            qname, tname, tstart = parts[0], parts[5], parts[7]
-            coords[qname] = (int(tstart), tname)
+            qname, strand, tname, tstart = parts[0], parts[4], parts[5], parts[7]
+            coords[qname] = (int(tstart), tname, strand)
     return coords
 
 
