@@ -316,6 +316,9 @@ def main():
     eval_reads = simulate_reads(args, reference_seq, pore_model, args.n_query, args.seed + 1, "eval", squig_fasta)
     print(f"[info] simulated {len(train_reads)} train / {len(eval_reads)} eval reads "
           f"(forward_only={bool(args.forward_only)})")
+    n_distinct = len(set(r.reference_start for r in eval_reads))
+    print(f"[info] distinct eval coords = {n_distinct} / {len(eval_reads)} "
+          f"(should be ~= n_query; ==1 means the coordinate bug is back)")
 
     # --- random baseline ---
     rec_random = evaluate_random(

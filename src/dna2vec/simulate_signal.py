@@ -83,19 +83,27 @@ def simulate_mapped_signals(
 
     subprocess.run(cmd, check=True)
 
-    coords = _parse_paf_coords(paf)
-
+    # IMPORTANT: squigulator's --paf reports the signal-vs-read alignment, whose
+    # target start is always 0 (the read starts at sample 0 of its own signal) —
+    # it is NOT a genomic coordinate. The true genomic start/strand are encoded
+    # in the read id, e.g. "S1_1!NC_000913.3!1956875!1958160!-":
+    #   parts[-4]=contig, parts[-3]=start, parts[-2]=end, parts[-1]=strand.
+    # The PAF is still written above and can be parsed via _parse_paf_coords for
+    # debugging, but coordinates here come from the read id.
     reads: List[SignalReadAndRef] = []
     s = pyslow5.Open(blow5, "r")
     for read in s.seq_reads(pA=True):
         rid = read["read_id"]
-        if rid not in coords:
+        parts = str(rid).split("!")
+        if len(parts) < 4:  # not squigulator's !-encoded id -> skip
             continue
-        tstart, tname, strand = coords[rid]
+        tname = parts[-4]
+        tstart = int(parts[-3])
+        strand = parts[-1]
         reads.append(
             SignalReadAndRef(
                 signal=np.asarray(read["signal"], dtype=np.float32),
-                reference_start=int(tstart),
+                reference_start=tstart,
                 id=str(rid),
                 reference_name=tname,
                 strand=strand,
@@ -107,9 +115,10 @@ def simulate_mapped_signals(
 def _parse_paf_coords(paf_path: str) -> dict:
     """read_id -> (target_start, target_name, strand) from a PAF file.
 
-    PAF columns (0-based): 0 qname, 4 strand, 5 tname, 7 target_start. Target
-    coordinates are always on the forward strand; a '-' read's bases are the
-    reverse complement of ``reference[tstart:tend]``.
+    Kept for debugging only. NOTE: squigulator's PAF target start is the
+    signal-vs-read offset (always 0), not a genomic coordinate — do not use it
+    for ground truth. Genomic coordinates come from the read id instead (see
+    ``simulate_mapped_signals``).
     """
     coords = {}
     with open(paf_path, "r") as f:
