@@ -90,6 +90,9 @@ def parse_args():
     p.add_argument("--temperature", type=float, default=0.05)
 
     p.add_argument("--tol_bp", type=int, default=15)
+    p.add_argument("--probe", type=int, default=1,
+                   help="1 = print a one-batch collapse probe (input/embedding across-batch std) "
+                        "before training, to localize a stuck ln(N) loss.")
     p.add_argument("--use_synthetic", action="store_true",
                    help="Use the synthetic pore-model simulator instead of squigulator.")
     p.add_argument("--squigulator_profile", type=str, default="dna-r9-min")
@@ -195,6 +198,40 @@ def train_encoder(encoder, pooling, dataset, device, args):
     wandb.log = _stdout_log
 
     dataloader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=signal_collate)
+
+    # --- collapse probe -------------------------------------------------
+    # loss stuck at ln(batch_size) with zero gradient == embeddings collapsed
+    # to a constant. This localizes WHICH side/stage collapsed:
+    #   * x_2 ref global_std ~ 0        -> reference expected signal is constant
+    #                                      (empty/OOB slice, or synthetic pore)
+    #   * x_2 has variance but y_2
+    #     across-batch std ~ 0          -> encoder flattens the reference input
+    #                                      (mask/T-alignment zeroing the sequence)
+    #   * x_1 query global_std ~ 0      -> pyslow5 signal empty/constant
+    if getattr(args, "probe", 1):
+        xb1, xb2 = next(iter(dataloader))
+
+        def _s(t):
+            t = t.float()
+            return (f"shape={tuple(t.shape)}  global_std={t.std().item():.4f}  "
+                    f"per-sample-mean_std={t.mean(1).std().item():.4f}")
+
+        print("[probe] x_1 query :", _s(xb1["signal"]), flush=True)
+        print("[probe] x_2 ref   :", _s(xb2["signal"]), flush=True)
+        print("[probe] mask sums x1:", xb1["attention_mask"].sum(1)[:5].tolist(),
+              " x2:", xb2["attention_mask"].sum(1)[:5].tolist(), flush=True)
+        with torch.no_grad():
+            e = encoder.to(device).eval()
+            h1 = e(**{k: v.to(device) for k, v in xb1.items()})
+            h2 = e(**{k: v.to(device) for k, v in xb2.items()})
+            y1 = pooling(h1, attention_mask=xb1["attention_mask"].to(device))
+            y2 = pooling(h2, attention_mask=xb2["attention_mask"].to(device))
+        print("[probe] y_1 across-batch std:", y1.std(0).mean().item(), flush=True)
+        print("[probe] y_2 across-batch std:", y2.std(0).mean().item(),
+              "  <- ~0 means the reference side collapsed", flush=True)
+        encoder.train()
+    # --------------------------------------------------------------------
+
     optimizer = torch.optim.Adam(encoder.parameters(), lr=args.lr)
     scheduler = OneCycleLR(optimizer, max_lr=args.lr, total_steps=args.train_steps + 1)
     similarity = SimilarityWithTemperature(temperature=args.temperature)
