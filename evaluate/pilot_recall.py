@@ -69,10 +69,34 @@ def parse_args():
                    help="Truncate the reference to this many bp for the pilot (0 = full genome). "
                         "The SAME truncated sequence is fed to squigulator, so coordinates stay aligned.")
     p.add_argument("--unit_length", type=int, default=300)
-    p.add_argument("--overlap", type=int, default=150)
+    p.add_argument("--overlap", type=int, default=285,
+                   help="Index tiling overlap; default 285 (stride 15) removes the "
+                        "'best window not aligned to read start' ceiling artifact.")
+    p.add_argument("--index_stride", type=int, default=0,
+                   help="Index tiling step; 0 = unit_length - overlap. Set to decouple "
+                        "index density from --overlap if VRAM is tight.")
     p.add_argument("--forward_only", type=int, default=1,
-                   help="1 = keep only '+'-strand reads (forward-only index). M0 default; "
-                        "strand-aware dual-index is M1.")
+                   help="1 = keep only '+'-strand reads (forward-only index). "
+                        "strand-aware dual-index is a later item.")
+
+    # --- hard-negative mining (Stage-1 precision lever) ---
+    p.add_argument("--hard_negatives", type=int, default=8,
+                   help="H near-coordinate hard negatives per anchor. 0 = fall back to "
+                        "the unmodified ContrastiveTrainer path (ablation baseline).")
+    p.add_argument("--hard_neg_min_bp", type=int, default=30)
+    p.add_argument("--hard_neg_max_bp", type=int, default=300)
+
+    # --- checkpoint (train/eval separation) ---
+    p.add_argument("--save_encoder", type=str, default=None)
+    p.add_argument("--load_encoder", type=str, default=None,
+                   help="If given and exists, skip training and evaluate this checkpoint.")
+
+    # --- noise sweep (fixed model, vary squigulator noise) ---
+    p.add_argument("--amp_noise", type=float, default=None)
+    p.add_argument("--dwell_std", type=float, default=None)
+
+    p.add_argument("--results_csv", type=str, default=None,
+                   help="CSV to append results to (default: evaluate/signal_pilot_results.csv).")
 
     p.add_argument("--n_train", type=int, default=20000)
     p.add_argument("--n_query", type=int, default=2000)
@@ -120,13 +144,18 @@ def make_signal_model(args, device, trained_encoder=None):
     return model, cfg
 
 
+def resolve_index_stride(args):
+    return args.index_stride if args.index_stride else (args.unit_length - args.overlap)
+
+
 def build_store(signal_model, name, device, reference_seq, pore_model, args):
+    stride = resolve_index_stride(args)
     store = SignalFaissStore(signal_model=signal_model, index_name=name, device=device)
     store.drop_table()  # start clean for a reproducible pilot
     store = SignalFaissStore(signal_model=signal_model, index_name=name, device=device)
     build_signal_reference_index(
         reference_seq=reference_seq, pore_model=pore_model, signal_model=signal_model,
-        store=store, unit_length=args.unit_length, overlap=args.overlap,
+        store=store, unit_length=args.unit_length, stride=stride,
     )
     return store
 
@@ -142,6 +171,14 @@ def _covers(coord, true_coord, unit_length, tol_bp):
     return (coord - tol_bp) <= true_coord < (coord + unit_length + tol_bp)
 
 
+def _first_hit_rank(cands, true_coord, unit_length, tol_bp):
+    """1-based rank of the first covering candidate, or 0 if none."""
+    for j, c in enumerate(cands):
+        if _covers(int(c), true_coord, unit_length, tol_bp):
+            return j + 1
+    return 0
+
+
 def evaluate_recall(store, eval_reads, topk_list, tol_bp, unit_length):
     signals = [r.signal for r in eval_reads]
     coords = [r.reference_start for r in eval_reads]
@@ -149,29 +186,152 @@ def evaluate_recall(store, eval_reads, topk_list, tol_bp, unit_length):
     results = store.query_batch(signals, coords, top_k=max_k)
 
     hits = {k: 0 for k in topk_list}
+    mrr = 0.0
     for res in results:
         true_coord = res["index"]
         cand = [m["metadata"]["coord"] for m in res["matches"]]
+        rank = _first_hit_rank(cand, true_coord, unit_length, tol_bp)
+        if rank:
+            mrr += 1.0 / rank
         for k in topk_list:
-            if any(_covers(c, true_coord, unit_length, tol_bp) for c in cand[:k]):
+            if rank and rank <= k:
                 hits[k] += 1
     n = len(eval_reads)
-    return {k: hits[k] / n for k in topk_list}
+    return {k: hits[k] / n for k in topk_list}, mrr / n
 
 
-def evaluate_random(reference_len, eval_reads, unit_length, overlap, topk_list, tol_bp, seed):
+def evaluate_random(reference_len, eval_reads, unit_length, stride, topk_list, tol_bp, seed):
     rng = np.random.default_rng(seed)
-    step = max(1, unit_length - overlap)
+    step = max(1, stride)
     starts = np.arange(0, reference_len - unit_length + 1, step)
     max_k = max(topk_list)
     hits = {k: 0 for k in topk_list}
+    mrr = 0.0
     for r in eval_reads:
         picks = rng.choice(starts, size=min(max_k, len(starts)), replace=False)
+        rank = _first_hit_rank([int(c) for c in picks], r.reference_start, unit_length, tol_bp)
+        if rank:
+            mrr += 1.0 / rank
         for k in topk_list:
-            if any(_covers(int(c), r.reference_start, unit_length, tol_bp) for c in picks[:k]):
+            if rank and rank <= k:
                 hits[k] += 1
     n = len(eval_reads)
-    return {k: hits[k] / n for k in topk_list}
+    return {k: hits[k] / n for k in topk_list}, mrr / n
+
+
+def run_collapse_probe(encoder, pooling, dataloader, device, args):
+    """One-batch collapse probe (localizes a stuck ln(N) loss). Handles both the
+    2-tuple (no hard-neg) and 3-tuple (hard-neg) collate outputs."""
+    if not getattr(args, "probe", 1):
+        return
+    batch = next(iter(dataloader))
+    xb1, xb2 = batch[0], batch[1]
+
+    def _s(t):
+        t = t.float()
+        return (f"shape={tuple(t.shape)}  global_std={t.std().item():.4f}  "
+                f"per-sample-mean_std={t.mean(1).std().item():.4f}")
+
+    print("[probe] x_1 query :", _s(xb1["signal"]), flush=True)
+    print("[probe] x_2 ref   :", _s(xb2["signal"]), flush=True)
+    print("[probe] mask sums x1:", xb1["attention_mask"].sum(1)[:5].tolist(),
+          " x2:", xb2["attention_mask"].sum(1)[:5].tolist(), flush=True)
+    with torch.no_grad():
+        e = encoder.to(device).eval()
+        h1 = e(**{k: v.to(device) for k, v in xb1.items()})
+        h2 = e(**{k: v.to(device) for k, v in xb2.items()})
+        y1 = pooling(h1, attention_mask=xb1["attention_mask"].to(device))
+        y2 = pooling(h2, attention_mask=xb2["attention_mask"].to(device))
+    print("[probe] y_1 across-batch std:", y1.std(0).mean().item(), flush=True)
+    print("[probe] y_2 across-batch std:", y2.std(0).mean().item(),
+          "  <- ~0 means the reference side collapsed", flush=True)
+    encoder.train()
+
+
+def _encode_pool_norm(encoder, pooling, x, device):
+    h = encoder(**{k: v.to(device) for k, v in x.items()})
+    y = pooling(h, attention_mask=x["attention_mask"].to(device))
+    return torch.nn.functional.normalize(y, dim=-1)
+
+
+def train_encoder_hardneg(encoder, pooling, dataset, device, args):
+    """InfoNCE with near-coordinate hard negatives, implemented HERE (not in
+    trainer.py). Per anchor the logits are [in-batch positives | H hard negs]:
+    logits[i] = [cos(y1_i, y2_j) for all j] ++ [cos(y1_i, yneg_i,h) for all h],
+    label = i (positive on the diagonal). Used when --hard_negatives > 0."""
+    from torch.utils.data import DataLoader
+    from torch.optim.lr_scheduler import OneCycleLR
+
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=signal_collate)
+    run_collapse_probe(encoder, pooling, dataloader, device, args)
+
+    encoder.to(device).train()
+    optimizer = torch.optim.Adam(encoder.parameters(), lr=args.lr)
+    scheduler = OneCycleLR(optimizer, max_lr=args.lr, total_steps=args.train_steps + 1)
+    ce = torch.nn.CrossEntropyLoss()
+    temp = args.temperature
+
+    data_iter = iter(dataloader)
+    for step in range(args.train_steps):
+        x1, x2, xneg = next(data_iter)
+        y1 = _encode_pool_norm(encoder, pooling, x1, device)   # [B, D]
+        y2 = _encode_pool_norm(encoder, pooling, x2, device)   # [B, D]
+
+        B, H, L = xneg["signal"].shape
+        T = xneg["attention_mask"].shape[2]
+        flat = {
+            "signal": xneg["signal"].reshape(B * H, L),
+            "attention_mask": xneg["attention_mask"].reshape(B * H, T),
+        }
+        yneg = _encode_pool_norm(encoder, pooling, flat, device).reshape(B, H, -1)  # [B,H,D]
+
+        logits_pos = (y1 @ y2.t()) / temp                              # [B, B]
+        logits_neg = torch.einsum("bd,bhd->bh", y1, yneg) / temp       # [B, H]
+        logits = torch.cat([logits_pos, logits_neg], dim=1)           # [B, B+H]
+        labels = torch.arange(B, device=device)
+        loss = ce(logits, labels)
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(encoder.parameters(), 1.0)
+        optimizer.step()
+        optimizer.zero_grad()
+        scheduler.step()
+
+        if step % 100 == 0:
+            lr = optimizer.param_groups[0]["lr"]
+            print(f"[train] step {step} loss {loss.item():.4f} lr {lr:.2e} "
+                  f"(hardneg H={H})", flush=True)
+
+    encoder.eval()
+    return encoder
+
+
+_ENCODER_CFG_FIELDS = [
+    "encoder_type", "conv_channels_1", "conv_channels_2", "conv_kernel_1",
+    "downsample_factor", "n_mamba_blocks", "d_state", "d_conv", "expand",
+    "num_heads", "dropout", "input_signal_len", "embedding_dim",
+]
+
+
+def save_encoder(path, encoder, cfg):
+    payload = {f: getattr(cfg, f) for f in _ENCODER_CFG_FIELDS}
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"model": encoder.state_dict(), "signal_config": payload}, path)
+    print(f"[info] saved encoder -> {path}", flush=True)
+
+
+def load_encoder(path, device, args):
+    ckpt = torch.load(path, map_location="cpu")
+    cfg = SignalModelConfigSchema(**ckpt["signal_config"])
+    encoder, pooling = signal_encoder_from_config(cfg)
+    encoder.load_state_dict(ckpt["model"])
+    model = SignalEvalModel(
+        encoder=encoder, pooling=pooling, device=device,
+        input_signal_len=cfg.input_signal_len, downsample_factor=cfg.downsample_factor,
+        embedding_dim=cfg.embedding_dim,
+    )
+    print(f"[info] loaded encoder <- {path} (skipping training)", flush=True)
+    return model, cfg
 
 
 def train_encoder(encoder, pooling, dataset, device, args):
@@ -198,39 +358,7 @@ def train_encoder(encoder, pooling, dataset, device, args):
     wandb.log = _stdout_log
 
     dataloader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=signal_collate)
-
-    # --- collapse probe -------------------------------------------------
-    # loss stuck at ln(batch_size) with zero gradient == embeddings collapsed
-    # to a constant. This localizes WHICH side/stage collapsed:
-    #   * x_2 ref global_std ~ 0        -> reference expected signal is constant
-    #                                      (empty/OOB slice, or synthetic pore)
-    #   * x_2 has variance but y_2
-    #     across-batch std ~ 0          -> encoder flattens the reference input
-    #                                      (mask/T-alignment zeroing the sequence)
-    #   * x_1 query global_std ~ 0      -> pyslow5 signal empty/constant
-    if getattr(args, "probe", 1):
-        xb1, xb2 = next(iter(dataloader))
-
-        def _s(t):
-            t = t.float()
-            return (f"shape={tuple(t.shape)}  global_std={t.std().item():.4f}  "
-                    f"per-sample-mean_std={t.mean(1).std().item():.4f}")
-
-        print("[probe] x_1 query :", _s(xb1["signal"]), flush=True)
-        print("[probe] x_2 ref   :", _s(xb2["signal"]), flush=True)
-        print("[probe] mask sums x1:", xb1["attention_mask"].sum(1)[:5].tolist(),
-              " x2:", xb2["attention_mask"].sum(1)[:5].tolist(), flush=True)
-        with torch.no_grad():
-            e = encoder.to(device).eval()
-            h1 = e(**{k: v.to(device) for k, v in xb1.items()})
-            h2 = e(**{k: v.to(device) for k, v in xb2.items()})
-            y1 = pooling(h1, attention_mask=xb1["attention_mask"].to(device))
-            y2 = pooling(h2, attention_mask=xb2["attention_mask"].to(device))
-        print("[probe] y_1 across-batch std:", y1.std(0).mean().item(), flush=True)
-        print("[probe] y_2 across-batch std:", y2.std(0).mean().item(),
-              "  <- ~0 means the reference side collapsed", flush=True)
-        encoder.train()
-    # --------------------------------------------------------------------
+    run_collapse_probe(encoder, pooling, dataloader, device, args)
 
     optimizer = torch.optim.Adam(encoder.parameters(), lr=args.lr)
     scheduler = OneCycleLR(optimizer, max_lr=args.lr, total_steps=args.train_steps + 1)
@@ -272,16 +400,43 @@ def simulate_reads(args, reference_seq, pore_model, n_reads, seed, tag, squig_fa
         reads = simulate_mapped_signals(
             reference_genome=squig_fasta, n_reads=n_reads,
             read_length_bp=args.read_length_bp, profile=args.squigulator_profile,
-            seed=seed,
+            seed=seed, amp_noise=args.amp_noise, dwell_std=args.dwell_std,
         )
     if args.forward_only:
         reads = [r for r in reads if r.strand == "+"]
     return reads
 
 
-def print_table(name, recall, topk_list):
+def print_table(name, recall, mrr, topk_list):
     cells = "  ".join(f"@{k}={recall[k]*100:5.1f}%" for k in topk_list)
-    print(f"  {name:<10s}  {cells}")
+    print(f"  {name:<10s}  {cells}   MRR={mrr:.3f}")
+
+
+def append_results_csv(csv_path, args, topk_list, rows):
+    """Append one row per arm with recall@k, MRR and key hyperparameters."""
+    import csv
+    from datetime import datetime
+
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    hparams = ["hard_negatives", "overlap", "index_stride", "amp_noise", "dwell_std",
+               "ref_bp", "n_train", "train_steps", "unit_length", "tol_bp"]
+    header = (["timestamp", "arm"] + [f"recall@{k}" for k in topk_list] + ["mrr"] + hparams)
+    stride = resolve_index_stride(args)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    write_header = not csv_path.exists()
+    with open(csv_path, "a", newline="") as f:
+        w = csv.writer(f)
+        if write_header:
+            w.writerow(header)
+        for arm, recall, mrr in rows:
+            row = [ts, arm] + [f"{recall[k]:.4f}" for k in topk_list] + [f"{mrr:.4f}"]
+            row += [args.hard_negatives, args.overlap, stride, args.amp_noise,
+                    args.dwell_std, args.ref_bp, args.n_train, args.train_steps,
+                    args.unit_length, args.tol_bp]
+            w.writerow(row)
+    print(f"[info] appended {len(rows)} rows -> {csv_path}", flush=True)
 
 
 def main():
@@ -289,7 +444,7 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     device = args.device if torch.cuda.is_available() else "cpu"
-    topk_list = [1, 5, 10, 50]
+    topk_list = [1, 5, 10, 20, 50, 75, 100]
 
     pore_model = PoreModel(
         kmer_table_path=args.pore_model, kmer_len=args.kmer_len,
@@ -297,15 +452,17 @@ def main():
     )
     if pore_model.synthetic:
         print("[warn] No pore-model table -> SYNTHETIC pore model. "
-              "Plumbing smoke-test only; not a valid go/no-go measurement.")
+              "Plumbing smoke-test only; not a valid measurement.")
 
     reference_seq = read_single_fasta(args.reference_fasta)
     if args.ref_bp and len(reference_seq) > args.ref_bp:
         reference_seq = reference_seq[: args.ref_bp]
-    print(f"[info] reference length = {len(reference_seq)} bp; device = {device}")
+    stride = resolve_index_stride(args)
+    print(f"[info] reference length = {len(reference_seq)} bp; device = {device}; "
+          f"index stride = {stride}; hard_negatives = {args.hard_negatives}")
 
-    # Feed squigulator the EXACT sequence we index, as a single record, so its
-    # PAF coordinates align with our reference_seq (fixes the coord-frame bug).
+    # Feed squigulator the EXACT sequence we index, as a single record, so read
+    # coordinates align with our reference_seq (coord-frame guarantee).
     import tempfile
     squig_fasta = write_single_record_fasta(
         reference_seq, os.path.join(tempfile.mkdtemp(prefix="pilot_ref_"), "ref.fasta")
@@ -321,8 +478,8 @@ def main():
           f"(should be ~= n_query; ==1 means the coordinate bug is back)")
 
     # --- random baseline ---
-    rec_random = evaluate_random(
-        len(reference_seq), eval_reads, args.unit_length, args.overlap,
+    rec_random, mrr_random = evaluate_random(
+        len(reference_seq), eval_reads, args.unit_length, stride,
         topk_list, args.tol_bp, args.seed,
     )
 
@@ -330,35 +487,55 @@ def main():
     untrained_model, _ = make_signal_model(args, device)
     store_u = build_store(untrained_model, "signal-pilot-untrained", device,
                           reference_seq, pore_model, args)
-    rec_untrained = evaluate_recall(store_u, eval_reads, topk_list, args.tol_bp, args.unit_length)
+    rec_untrained, mrr_untrained = evaluate_recall(
+        store_u, eval_reads, topk_list, args.tol_bp, args.unit_length)
 
-    # --- trained encoder ---
-    trained_model, cfg = make_signal_model(args, device)
-    dataset = SignalPairDataset(
-        query_signals=[r.signal for r in train_reads],
-        query_coords=[r.reference_start for r in train_reads],
-        reference_seq=reference_seq, pore_model=pore_model,
-        unit_length=args.unit_length,
-        input_signal_len=args.input_signal_len, downsample_factor=args.downsample_factor,
-        samples_per_kmer=args.samples_per_kmer,
-    )
-    trained_encoder = train_encoder(
-        trained_model.encoder, trained_model.pooling, dataset, device, args
-    )
-    trained_model.encoder = trained_encoder
+    # --- trained (or loaded) encoder ---
+    if args.load_encoder and os.path.exists(args.load_encoder):
+        trained_model, cfg = load_encoder(args.load_encoder, device, args)
+    else:
+        trained_model, cfg = make_signal_model(args, device)
+        dataset = SignalPairDataset(
+            query_signals=[r.signal for r in train_reads],
+            query_coords=[r.reference_start for r in train_reads],
+            reference_seq=reference_seq, pore_model=pore_model,
+            unit_length=args.unit_length,
+            input_signal_len=args.input_signal_len, downsample_factor=args.downsample_factor,
+            samples_per_kmer=args.samples_per_kmer,
+            hard_negatives=args.hard_negatives,
+            hard_neg_min_bp=args.hard_neg_min_bp, hard_neg_max_bp=args.hard_neg_max_bp,
+        )
+        if args.hard_negatives > 0:
+            trained_encoder = train_encoder_hardneg(
+                trained_model.encoder, trained_model.pooling, dataset, device, args)
+        else:
+            trained_encoder = train_encoder(
+                trained_model.encoder, trained_model.pooling, dataset, device, args)
+        trained_model.encoder = trained_encoder
+        if args.save_encoder:
+            save_encoder(args.save_encoder, trained_model.encoder, cfg)
+
     store_t = build_store(trained_model, "signal-pilot-trained", device,
                           reference_seq, pore_model, args)
-    rec_trained = evaluate_recall(store_t, eval_reads, topk_list, args.tol_bp, args.unit_length)
+    rec_trained, mrr_trained = evaluate_recall(
+        store_t, eval_reads, topk_list, args.tol_bp, args.unit_length)
 
     # --- report ---
-    print("\n================ M0 recall (tol +/-%dbp) ================" % args.tol_bp)
-    print_table("random", rec_random, topk_list)
-    print_table("untrained", rec_untrained, topk_list)
-    print_table("trained", rec_trained, topk_list)
-    print("=========================================================")
+    print("\n================ recall (tol +/-%dbp, coverage) ================" % args.tol_bp)
+    print_table("random", rec_random, mrr_random, topk_list)
+    print_table("untrained", rec_untrained, mrr_untrained, topk_list)
+    print_table("trained", rec_trained, mrr_trained, topk_list)
+    print("================================================================")
     verdict = (rec_trained[10] > rec_untrained[10] > rec_random[10])
     print(f"[go/no-go] trained > untrained > random @10: "
-          f"{'GO' if verdict else 'NO-GO (investigate before M1)'}")
+          f"{'GO' if verdict else 'NO-GO (investigate)'}")
+
+    csv_path = args.results_csv or (Path(__file__).resolve().parent / "signal_pilot_results.csv")
+    append_results_csv(csv_path, args, topk_list, [
+        ("random", rec_random, mrr_random),
+        ("untrained", rec_untrained, mrr_untrained),
+        ("trained", rec_trained, mrr_trained),
+    ])
 
 
 if __name__ == "__main__":

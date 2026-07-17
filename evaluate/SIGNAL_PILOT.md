@@ -124,3 +124,53 @@ First read the loss:
 
 Do **not** tune training hyperparameters before the loss is visible, and do
 **not** build M1 until M0 passes.
+
+## M1 Stage 1 — precision + noise sweep + reusable scaffold
+
+M0 passed (full E. coli: trained recall@10 ≈ 60% ≫ untrained ≫ random). Stage 1
+pushes precision with **hard negatives + denser tiling** and turns the pilot
+into a checkpointable, noise-sweepable harness. All features are flags:
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--hard_negatives H` | 8 | H near-coordinate hard negatives per anchor. **0 = fall back to the unmodified `trainer.py` path** (ablation baseline). |
+| `--hard_neg_min_bp` / `--hard_neg_max_bp` | 30 / 300 | offset range for hard negatives. |
+| `--overlap` | 285 | index tiling overlap (stride 15 at unit_length 300). |
+| `--index_stride` | 0 (=unit_length−overlap) | decouple index density from `--overlap` if VRAM is tight. |
+| `--save_encoder PATH` / `--load_encoder PATH` | – | save encoder+config / skip training and evaluate a checkpoint. |
+| `--amp_noise` / `--dwell_std` | profile default | appended to squigulator (`--amp-noise` / `--dwell-std`) for the noise sweep. |
+| `--results_csv PATH` | evaluate/signal_pilot_results.csv | append 3-arm recall@{1,5,10,20,50,75,100} + MRR + hyperparams. |
+
+Hard-negative InfoNCE is implemented **in the pilot**, not in `trainer.py`: per
+anchor the logits are `[in-batch positives | H hard negatives]`, label on the
+diagonal. With `H=0` the dataset yields 2-tuples and training goes through the
+untouched `ContrastiveTrainer`.
+
+Suggested runs:
+```bash
+# precision: hard negatives + dense tiling, save the encoder
+python evaluate/pilot_recall.py --reference_fasta <genome.fasta> \
+    --pore_model $PORE_MODEL_PATH --device cuda:0 --train_steps 3000 \
+    --input_signal_len 3000 --hard_negatives 8 --overlap 285 \
+    --save_encoder evaluate/signal_checkpoints/hn8.pt
+
+# ablation: no hard negatives (unmodified trainer path)
+python evaluate/pilot_recall.py ... --hard_negatives 0
+
+# noise sweep on a fixed model (no retrain)
+python evaluate/pilot_recall.py ... --load_encoder evaluate/signal_checkpoints/hn8.pt \
+    --amp_noise 1.5 --dwell_std 4.0
+```
+
+**Validation gates (self-check each as you go):**
+1. With hard negatives: probe `y_2 across-batch std > 0`, `distinct eval coords ≈
+   n_query`, loss falls from ~ln(batch). Hard negatives make loss converge
+   slower to a **higher** floor (not 1e-4) — that is correct; the earlier
+   instant-0 loss was the task being too easy.
+2. `--load_encoder` reproducibility: same checkpoint evaluated twice gives
+   identical recall.
+3. `git diff` empty for `faiss_store.py` / `trainer.py` / `AveragePooler`.
+4. No hardcoded absolute paths.
+
+Out of scope for Stage 1 (a later round): SW/DTW refinement, cascade baseline
+(basecall→minimap2), RawHash comparison, encoder ablation.

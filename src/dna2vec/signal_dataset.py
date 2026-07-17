@@ -80,6 +80,9 @@ class SignalPairDataset(IterableDataset):
         input_signal_len: int = 2000,
         downsample_factor: int = 5,
         samples_per_kmer: int = 9,
+        hard_negatives: int = 0,
+        hard_neg_min_bp: int = 30,
+        hard_neg_max_bp: int = 300,
     ):
         super().__init__()
         assert len(query_signals) == len(query_coords)
@@ -94,23 +97,48 @@ class SignalPairDataset(IterableDataset):
         # vector length that does not exist in the FAISS index, and the true
         # window is pushed out of the top-k (recall can drop below random).
         self.win_bp = unit_length
+        self.max_start = max(0, len(reference_seq) - self.win_bp)
 
-    def _pair(self, idx: int) -> Tuple[Dict, Dict]:
+        self.hard_negatives = hard_negatives
+        self.hard_neg_min_bp = hard_neg_min_bp
+        self.hard_neg_max_bp = hard_neg_max_bp
+
+    def _ref_window(self, coord: int):
+        """Expected-signal window (z-normed, fixed length) at a genomic coord."""
+        coord = int(min(max(coord, 0), self.max_start))
+        ref_bases = self.reference_seq[coord : coord + self.win_bp]
+        ref_signal = self.pore_model.sequence_to_signal(ref_bases)
+        return preprocess_window(ref_signal, self.input_signal_len, self.downsample_factor)
+
+    def _pair(self, idx: int):
         coord = int(self.query_coords[idx])
 
         q_sig, q_mask = preprocess_window(
             self.query_signals[idx], self.input_signal_len, self.downsample_factor
         )
-
-        ref_bases = self.reference_seq[coord : coord + self.win_bp]
-        ref_signal = self.pore_model.sequence_to_signal(ref_bases)
-        r_sig, r_mask = preprocess_window(
-            ref_signal, self.input_signal_len, self.downsample_factor
-        )
+        r_sig, r_mask = self._ref_window(coord)
 
         x_1 = {"signal": q_sig, "attention_mask": q_mask}
         x_2 = {"signal": r_sig, "attention_mask": r_mask}
-        return x_1, x_2
+
+        if self.hard_negatives <= 0:
+            return x_1, x_2
+
+        # Near-coordinate hard negatives: same span, offset by [min,max] bp on a
+        # random side. These force fine positional discrimination that in-batch
+        # random negatives (almost always far away) never exercise.
+        neg_sigs, neg_masks = [], []
+        for _ in range(self.hard_negatives):
+            sign = 1 if np.random.rand() < 0.5 else -1
+            offset = np.random.randint(self.hard_neg_min_bp, self.hard_neg_max_bp + 1)
+            ns, nm = self._ref_window(coord + sign * offset)
+            neg_sigs.append(ns)
+            neg_masks.append(nm)
+        x_neg = {
+            "signal": np.stack(neg_sigs),           # [H, L]
+            "attention_mask": np.stack(neg_masks),  # [H, T]
+        }
+        return x_1, x_2, x_neg
 
     def __iter__(self):
         n = len(self.query_signals)
@@ -119,13 +147,26 @@ class SignalPairDataset(IterableDataset):
             yield self._pair(idx)
 
 
-def signal_collate(batch) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-    """Stack a list of (x_1, x_2) pairs into batched tensor dicts."""
-    x_1_list, x_2_list = list(zip(*batch))
+def signal_collate(batch):
+    """Stack (x_1, x_2) — or (x_1, x_2, x_neg) when hard negatives are on.
+
+    Without negatives returns ``(x_1, x_2)`` (the shape ``ContrastiveTrainer``
+    expects, so the H=0 path stays on the unmodified trainer). With negatives
+    returns ``(x_1, x_2, x_neg)`` where x_neg is ``[B, H, L]`` / ``[B, H, T]``.
+    """
+    has_neg = len(batch[0]) == 3
 
     def stack(dicts):
         signals = torch.from_numpy(np.stack([d["signal"] for d in dicts])).float()
         masks = torch.from_numpy(np.stack([d["attention_mask"] for d in dicts])).long()
         return {"signal": signals, "attention_mask": masks}
 
-    return stack(x_1_list), stack(x_2_list)
+    x_1 = stack([b[0] for b in batch])
+    x_2 = stack([b[1] for b in batch])
+    if not has_neg:
+        return x_1, x_2
+
+    neg_signal = torch.from_numpy(np.stack([b[2]["signal"] for b in batch])).float()
+    neg_mask = torch.from_numpy(np.stack([b[2]["attention_mask"] for b in batch])).long()
+    x_neg = {"signal": neg_signal, "attention_mask": neg_mask}
+    return x_1, x_2, x_neg

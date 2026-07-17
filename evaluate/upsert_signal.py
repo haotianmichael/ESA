@@ -32,12 +32,17 @@ def build_signal_reference_index(
     signal_model,
     store,
     unit_length: int = 300,
-    overlap: int = 150,
+    stride: int = 150,
     namespace: str = "ref",
     encode_batch: int = 2048,
 ):
-    """Window the reference, embed expected signals, and populate ``store``."""
-    step = max(1, unit_length - overlap)
+    """Window the reference, embed expected signals, and populate ``store``.
+
+    ``stride`` is the index tiling step (decoupled from training). A small
+    stride (e.g. 15) removes the "best window not aligned to the read start"
+    ceiling artifact at the cost of more windows.
+    """
+    step = max(1, stride)
     starts = list(range(0, len(reference_seq) - unit_length + 1, step))
 
     buf_signals: List[np.ndarray] = []

@@ -45,6 +45,8 @@ def simulate_mapped_signals(
     seed: Optional[int] = None,
     squigulator_bin: str = "squigulator",
     paf_option: str = "--paf",
+    amp_noise: Optional[float] = None,
+    dwell_std: Optional[float] = None,
     extra_args: Optional[List[str]] = None,
 ) -> List[SignalReadAndRef]:
     """
@@ -78,6 +80,10 @@ def simulate_mapped_signals(
     ]
     if seed is not None:
         cmd += ["--seed", str(seed)]
+    if amp_noise is not None:
+        cmd += ["--amp-noise", str(amp_noise)]
+    if dwell_std is not None:
+        cmd += ["--dwell-std", str(dwell_std)]
     if extra_args:
         cmd += list(extra_args)
 
