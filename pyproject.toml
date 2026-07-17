@@ -46,7 +46,7 @@ signal = [
   "mamba-ssm>=2.0.0",
   "causal-conv1d>=1.2.0",
   "pyslow5>=1.0.0",
-  "fastdtw>=0.3.4",
+  "dtaidistance>=2.3.10",
 ]
 tests = [
   "pytest>=7.1.2",

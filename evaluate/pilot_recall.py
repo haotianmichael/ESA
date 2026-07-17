@@ -52,6 +52,7 @@ from dna2vec.simulate_signal import (  # noqa: E402
 from inference_signal import SignalEvalModel  # noqa: E402
 from upsert_signal import read_single_fasta, build_signal_reference_index  # noqa: E402
 from signal_faiss_store import SignalFaissStore  # noqa: E402
+from refine import dtw_refine_one  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -96,7 +97,20 @@ def parse_args():
     p.add_argument("--dwell_std", type=float, default=None)
 
     p.add_argument("--results_csv", type=str, default=None,
-                   help="CSV to append results to (default: evaluate/signal_pilot_results.csv).")
+                   help="CSV to append recall@k results to (default: evaluate/signal_pilot_results.csv).")
+
+    # --- Step 2a: DTW refinement -> single mapping (P/R/F1) ---
+    p.add_argument("--refine", type=str, default="none", choices=["none", "dtw"],
+                   help="'dtw' = DTW-refine top-k candidates into one mapping; "
+                        "'none' = single mapping is the top-1 retrieval (behavior unchanged).")
+    p.add_argument("--refine_topk", type=int, default=20,
+                   help="Number of retrieval candidates DTW-reranks (refine=dtw).")
+    p.add_argument("--refine_dtw_ds", type=int, default=5,
+                   help="Mean-downsample factor applied to both signals before DTW.")
+    p.add_argument("--method_name", type=str, default="SquiggleSeek",
+                   help="Method label used in metrics CSV / logs.")
+    p.add_argument("--metrics_csv", type=str, default=None,
+                   help="CSV for single-mapping P/R/F1 (default: evaluate/squiggleseek_metrics.csv).")
 
     p.add_argument("--n_train", type=int, default=20000)
     p.add_argument("--n_query", type=int, default=2000)
@@ -334,6 +348,76 @@ def load_encoder(path, device, args):
     return model, cfg
 
 
+def evaluate_single_mapping(store, eval_reads, reference_seq, pore_model, args):
+    """Collapse retrieval to ONE mapping per read and score RawHash-style.
+
+    refine='dtw': DTW-rerank the top-`refine_topk` candidates, pick min cost.
+    refine='none': the single mapping is the top-1 retrieval (== recall@1).
+    A read is correct if its single reported position covers the true coord.
+    precision = correct / mapped, recall = correct / total, F1 = harmonic mean.
+    """
+    signals = [r.signal for r in eval_reads]
+    coords = [r.reference_start for r in eval_reads]
+    topk = args.refine_topk if args.refine == "dtw" else 1
+    results = store.query_batch(signals, coords, top_k=max(topk, 1))
+
+    correct = 0
+    n_mapped = 0
+    samples = []
+    for res in results:
+        true_coord = res["index"]
+        cand = [m["metadata"]["coord"] for m in res["matches"]]
+        if not cand:
+            continue  # unmapped (does not happen for flat retrieval, but be safe)
+        if args.refine == "dtw":
+            sel, _ = dtw_refine_one(
+                res["query"], cand[:topk], reference_seq, pore_model,
+                args.unit_length, ds=args.refine_dtw_ds,
+            )
+        else:
+            sel = cand[0]
+        n_mapped += 1
+        ok = _covers(sel, true_coord, args.unit_length, args.tol_bp)
+        correct += int(ok)
+        if len(samples) < 5:
+            samples.append((true_coord, sel, ok))
+
+    n = len(eval_reads)
+    precision = correct / n_mapped if n_mapped else 0.0
+    recall = correct / n if n else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    return {
+        "precision": precision, "recall": recall, "f1": f1,
+        "n_mapped": n_mapped, "n": n, "correct": correct, "samples": samples,
+    }
+
+
+def append_metrics_csv(csv_path, args, method, m):
+    """Append one single-mapping P/R/F1 row (unified head-to-head schema)."""
+    import csv
+    from datetime import datetime
+
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    header = ["timestamp", "method", "refine", "refine_topk",
+              "precision", "recall", "f1", "n_mapped", "n",
+              "amp_noise", "dwell_std", "hard_negatives", "overlap",
+              "index_stride", "ref_bp", "train_steps", "unit_length", "tol_bp"]
+    stride = resolve_index_stride(args)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    write_header = not csv_path.exists()
+    with open(csv_path, "a", newline="") as f:
+        w = csv.writer(f)
+        if write_header:
+            w.writerow(header)
+        w.writerow([ts, method, args.refine, args.refine_topk,
+                    f"{m['precision']:.4f}", f"{m['recall']:.4f}", f"{m['f1']:.4f}",
+                    m["n_mapped"], m["n"], args.amp_noise, args.dwell_std,
+                    args.hard_negatives, args.overlap, stride, args.ref_bp,
+                    args.train_steps, args.unit_length, args.tol_bp])
+    print(f"[info] appended metrics -> {csv_path}", flush=True)
+
+
 def train_encoder(encoder, pooling, dataset, device, args):
     """Contrastive training via the reused ContrastiveTrainer (InfoNCE)."""
     os.environ.setdefault("WANDB_MODE", "disabled")
@@ -536,6 +620,22 @@ def main():
         ("untrained", rec_untrained, mrr_untrained),
         ("trained", rec_trained, mrr_trained),
     ])
+
+    # --- Step 2a: single mapping (DTW refinement) -> precision/recall/F1 ---
+    m = evaluate_single_mapping(store_t, eval_reads, reference_seq, pore_model, args)
+    print(f"\n======== {args.method_name} single mapping (refine={args.refine}"
+          f"{', topk=%d' % args.refine_topk if args.refine == 'dtw' else ''}) ========")
+    print(f"  precision={m['precision']*100:.1f}%  recall={m['recall']*100:.1f}%  "
+          f"F1={m['f1']*100:.1f}%   (mapped {m['n_mapped']}/{m['n']}, correct {m['correct']})")
+    print(f"  sanity: single-mapping recall vs retrieval recall@1 = "
+          f"{m['recall']*100:.1f}% vs {rec_trained[1]*100:.1f}%")
+    print("  (true_coord, selected_coord, covered?) samples:")
+    for tc, sc, ok in m["samples"]:
+        print(f"    true={tc:>9d}  sel={sc:>9d}  {'HIT' if ok else 'miss'}")
+    print("================================================================")
+
+    metrics_csv = args.metrics_csv or (Path(__file__).resolve().parent / "squiggleseek_metrics.csv")
+    append_metrics_csv(metrics_csv, args, args.method_name, m)
 
 
 if __name__ == "__main__":

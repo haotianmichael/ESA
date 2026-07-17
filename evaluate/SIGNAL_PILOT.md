@@ -174,3 +174,40 @@ python evaluate/pilot_recall.py ... --load_encoder evaluate/signal_checkpoints/h
 
 Out of scope for Stage 1 (a later round): SW/DTW refinement, cascade baseline
 (basecall→minimap2), RawHash comparison, encoder ablation.
+
+## SquiggleSeek Stage 2 — single mapping + baselines
+
+The method is named **SquiggleSeek**. Stage 2 makes SquiggleSeek and the
+baselines each emit ONE best mapping under the same reads / true coords /
+`_covers` criterion, for a head-to-head precision/recall/F1 noise sweep. Built
+strictly in sub-steps; **only 2a is implemented so far.**
+
+### Step 2a — DTW refinement (done)
+
+Collapse top-k retrieval to a single mapping: for each query, DTW-align it to
+each candidate window's expected signal (C-backed `dtaidistance`, both signals
+z-normed + mean-downsampled) and keep the minimum-cost candidate. Then score
+RawHash-style: correct if the single reported position covers the true coord;
+`precision = correct/mapped`, `recall = correct/total`, `F1` harmonic mean.
+
+Flags: `--refine dtw|none` (default none), `--refine_topk` (20),
+`--refine_dtw_ds` (5), `--method_name` (SquiggleSeek), `--metrics_csv`.
+
+```bash
+python evaluate/pilot_recall.py --reference_fasta <genome.fasta> \
+    --pore_model $PORE_MODEL_PATH --device cuda:0 \
+    --load_encoder evaluate/signal_checkpoints/hn8.pt --batch_size 32 \
+    --refine dtw --refine_topk 20
+```
+Prints SquiggleSeek P/R/F1, `(true_coord, selected_coord, hit?)` samples, and the
+single-mapping-recall-vs-recall@1 sanity line; appends a row to
+`evaluate/squiggleseek_metrics.csv` (schema: method, refine, precision, recall,
+f1, n_mapped, amp_noise, dwell_std, … — the unified head-to-head schema that 2b
+/2c and the noise-sweep driver will reuse). `--refine none` reports the top-1
+retrieval unchanged.
+
+Validation gates: single-mapping recall ≈ (≥) retrieval recall@1; printed
+(true, selected) pairs are close; `--refine none` matches prior behavior.
+
+Steps 2b (cascade basecall→minimap2 + oracle) and 2c (RawHash) are **not yet
+implemented** — pending confirmation of 2a's P/R/F1.
