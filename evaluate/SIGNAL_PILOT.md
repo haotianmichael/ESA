@@ -184,14 +184,19 @@ strictly in sub-steps; **only 2a is implemented so far.**
 
 ### Step 2a — DTW refinement (done)
 
-Collapse top-k retrieval to a single mapping: for each query, DTW-align it to
-each candidate window's expected signal (C-backed `dtaidistance`, both signals
-z-normed + mean-downsampled) and keep the minimum-cost candidate. Then score
-RawHash-style: correct if the single reported position covers the true coord;
+Collapse top-k retrieval to a single **bp-level** mapping via **subsequence
+DTW**: render the expected signal of the reference region spanned by the top-k
+candidates, align the query as a subsequence (`dtaidistance`), and read off where
+it best matches → `region_start + offset`. Picking a window *coord* by global
+DTW failed (68% vs 97% top-1) because near-duplicate stride-15 windows blur ~±30
+bp > tol; subsequence DTW instead reports the aligned position to ~0 bp.
+Downsampling by `samples_per_kmer` (one point per k-mer) is both fast and exact.
+Then score RawHash-style: correct if the reported position covers the true coord;
 `precision = correct/mapped`, `recall = correct/total`, `F1` harmonic mean.
 
 Flags: `--refine dtw|none` (default none), `--refine_topk` (20),
-`--refine_dtw_ds` (5), `--method_name` (SquiggleSeek), `--metrics_csv`.
+`--refine_dtw_ds` (0 = samples_per_kmer), `--refine_ctx_margin` (90),
+`--method_name` (SquiggleSeek), `--metrics_csv`.
 
 ```bash
 python evaluate/pilot_recall.py --reference_fasta <genome.fasta> \

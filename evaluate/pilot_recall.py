@@ -104,9 +104,12 @@ def parse_args():
                    help="'dtw' = DTW-refine top-k candidates into one mapping; "
                         "'none' = single mapping is the top-1 retrieval (behavior unchanged).")
     p.add_argument("--refine_topk", type=int, default=20,
-                   help="Number of retrieval candidates DTW-reranks (refine=dtw).")
-    p.add_argument("--refine_dtw_ds", type=int, default=5,
-                   help="Mean-downsample factor applied to both signals before DTW.")
+                   help="Number of retrieval candidates whose span the subsequence DTW searches.")
+    p.add_argument("--refine_dtw_ds", type=int, default=0,
+                   help="Mean-downsample factor before DTW; 0 = samples_per_kmer (k-mer aligned, "
+                        "fast + exact).")
+    p.add_argument("--refine_ctx_margin", type=int, default=90,
+                   help="bp margin added around the candidate span for subsequence DTW.")
     p.add_argument("--method_name", type=str, default="SquiggleSeek",
                    help="Method label used in metrics CSV / logs.")
     p.add_argument("--metrics_csv", type=str, default=None,
@@ -373,6 +376,7 @@ def evaluate_single_mapping(store, eval_reads, reference_seq, pore_model, args):
             sel, _ = dtw_refine_one(
                 res["query"], cand[:topk], reference_seq, pore_model,
                 args.unit_length, ds=args.refine_dtw_ds,
+                ctx_margin=args.refine_ctx_margin,
             )
         else:
             sel = cand[0]
