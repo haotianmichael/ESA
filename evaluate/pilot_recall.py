@@ -52,7 +52,7 @@ from dna2vec.simulate_signal import (  # noqa: E402
 from inference_signal import SignalEvalModel  # noqa: E402
 from upsert_signal import read_single_fasta, build_signal_reference_index  # noqa: E402
 from signal_faiss_store import SignalFaissStore  # noqa: E402
-from refine import dtw_refine_one  # noqa: E402
+from refine import dtw_refine_one, dtw_rerank_one  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -113,7 +113,12 @@ def parse_args():
     p.add_argument("--method_name", type=str, default="SquiggleSeek",
                    help="Method label used in metrics CSV / logs.")
     p.add_argument("--metrics_csv", type=str, default=None,
-                   help="CSV for single-mapping P/R/F1 (default: evaluate/squiggleseek_metrics.csv).")
+                   help="CSV for per-arm P/R/F1 (default: evaluate/squiggleseek_metrics.csv).")
+    p.add_argument("--map_threshold", type=float, default=None,
+                   help="Confidence threshold: reads scoring below it are 'unmapped' "
+                        "(excluded from precision, still in recall denominator). None = map all.")
+    p.add_argument("--score_source", type=str, default="cosine", choices=["cosine", "dtw"],
+                   help="Confidence score for --map_threshold / the PR curve.")
 
     p.add_argument("--n_train", type=int, default=20000)
     p.add_argument("--n_query", type=int, default=2000)
@@ -186,6 +191,11 @@ def _covers(coord, true_coord, unit_length, tol_bp):
     point-distance criterion, whose ceiling is tol/stride.
     """
     return (coord - tol_bp) <= true_coord < (coord + unit_length + tol_bp)
+
+
+def _within(sel, true_coord, tol_bp):
+    """Symmetric criterion for a bp-level POINT estimate (DTW refine output)."""
+    return abs(sel - true_coord) <= tol_bp
 
 
 def _first_hit_rank(cands, true_coord, unit_length, tol_bp):
@@ -351,75 +361,123 @@ def load_encoder(path, device, args):
     return model, cfg
 
 
-def evaluate_single_mapping(store, eval_reads, reference_seq, pore_model, args):
-    """Collapse retrieval to ONE mapping per read and score RawHash-style.
+def _prf(correct, mapped, n):
+    precision = correct / mapped if mapped else 0.0
+    recall = correct / n if n else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    return precision, recall, f1
 
-    refine='dtw': DTW-rerank the top-`refine_topk` candidates, pick min cost.
-    refine='none': the single mapping is the top-1 retrieval (== recall@1).
-    A read is correct if its single reported position covers the true coord.
-    precision = correct / mapped, recall = correct / total, F1 = harmonic mean.
+
+def evaluate_arms(store, eval_reads, reference_seq, pore_model, args):
+    """Score three arms separately (never merged) under the RIGHT criterion:
+
+      retrieval-top1 : top-1 window coord          (_covers, window)
+      dtw-rerank     : DTW-chosen candidate coord   (_covers, window)
+      dtw-refine     : DTW bp point estimate        (_within, symmetric)
+
+    Also returns diagnostics: signed (refine - true) errors on the
+    rerank-correct subset, a 5-bin histogram, fallback rate, and per-read
+    (score, refine_correct) for the PR curve.
     """
     signals = [r.signal for r in eval_reads]
     coords = [r.reference_start for r in eval_reads]
-    topk = args.refine_topk if args.refine == "dtw" else 1
-    results = store.query_batch(signals, coords, top_k=max(topk, 1))
-
-    correct = 0
-    n_mapped = 0
-    samples = []
-    for res in results:
-        true_coord = res["index"]
-        cand = [m["metadata"]["coord"] for m in res["matches"]]
-        if not cand:
-            continue  # unmapped (does not happen for flat retrieval, but be safe)
-        if args.refine == "dtw":
-            sel, _ = dtw_refine_one(
-                res["query"], cand[:topk], reference_seq, pore_model,
-                args.unit_length, ds=args.refine_dtw_ds,
-                ctx_margin=args.refine_ctx_margin,
-            )
-        else:
-            sel = cand[0]
-        n_mapped += 1
-        ok = _covers(sel, true_coord, args.unit_length, args.tol_bp)
-        correct += int(ok)
-        if len(samples) < 5:
-            samples.append((true_coord, sel, ok))
-
+    topk = max(args.refine_topk, 1)
+    results = store.query_batch(signals, coords, top_k=topk)
     n = len(eval_reads)
-    precision = correct / n_mapped if n_mapped else 0.0
-    recall = correct / n if n else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    do_dtw = args.refine == "dtw"
+
+    top1_c = rerank_c = refine_c = refine_mapped = fallback = 0
+    signed, per_read, samples = [], [], []
+    for res in results:
+        true = res["index"]
+        cand = [m["metadata"]["coord"] for m in res["matches"]]
+        cos1 = float(res["matches"][0]["score"]) if res["matches"] else 0.0
+        if not cand:
+            continue
+        top1_ok = _covers(cand[0], true, args.unit_length, args.tol_bp)
+        top1_c += top1_ok
+        if not do_dtw:
+            per_read.append((cos1, top1_ok))
+            continue
+        rr, _ = dtw_rerank_one(res["query"], cand[:topk], reference_seq, pore_model,
+                               ds=args.refine_dtw_ds)
+        rr_ok = _covers(rr, true, args.unit_length, args.tol_bp)
+        rerank_c += rr_ok
+        rf, rf_cost, fb = dtw_refine_one(res["query"], cand[:topk], reference_seq,
+                                         pore_model, ds=args.refine_dtw_ds,
+                                         ctx_margin=args.refine_ctx_margin)
+        fallback += int(fb)
+        refine_mapped += 1
+        rf_ok = _within(rf, true, args.tol_bp)
+        refine_c += rf_ok
+        if rr_ok:
+            signed.append(rf - true)
+        score = (-rf_cost) if args.score_source == "dtw" else cos1
+        per_read.append((score, rf_ok))
+        if len(samples) < 6:
+            samples.append((true, rr, rf, rr_ok, rf_ok))
+
+    arms = {"retrieval-top1": (_prf(top1_c, n, n), "_covers")}
+    if do_dtw:
+        arms["dtw-rerank"] = (_prf(rerank_c, n, n), "_covers")
+        arms["dtw-refine"] = (_prf(refine_c, refine_mapped, n), "_within")
+
+    signed = np.array(signed) if signed else np.array([0])
+    hist = [int(np.sum(signed < -15)), int(np.sum((signed >= -15) & (signed < -5))),
+            int(np.sum((signed >= -5) & (signed <= 5))), int(np.sum((signed > 5) & (signed <= 15))),
+            int(np.sum(signed > 15))]
     return {
-        "precision": precision, "recall": recall, "f1": f1,
-        "n_mapped": n_mapped, "n": n, "correct": correct, "samples": samples,
+        "arms": arms, "n": n, "samples": samples, "per_read": per_read,
+        "fallback": fallback, "refine_mapped": refine_mapped,
+        "signed": {"median": float(np.median(signed)), "mean": float(signed.mean()),
+                   "std": float(signed.std()), "p10": float(np.percentile(signed, 10)),
+                   "p90": float(np.percentile(signed, 90)), "hist": hist},
     }
 
 
-def append_metrics_csv(csv_path, args, method, m):
-    """Append one single-mapping P/R/F1 row (unified head-to-head schema)."""
+def pr_curve(per_read, n, n_points=10):
+    """Sweep the confidence score -> list of (threshold, n_mapped, precision, recall, f1)."""
+    if not per_read:
+        return []
+    scores = sorted(s for s, _ in per_read)
+    qs = np.linspace(0, 1, n_points)
+    thresholds = sorted({float(np.quantile(scores, q)) for q in qs})
+    rows = []
+    for t in thresholds:
+        mapped = [(s, ok) for s, ok in per_read if s >= t]
+        correct = sum(ok for _, ok in mapped)
+        p, r, f = _prf(correct, len(mapped), n)
+        rows.append((t, len(mapped), p, r, f))
+    return rows
+
+
+def append_metrics_csv(csv_path, args, method, result):
+    """Append one row PER ARM (arm + criterion columns; never merged)."""
     import csv
     from datetime import datetime
 
     csv_path = Path(csv_path)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    header = ["timestamp", "method", "refine", "refine_topk",
-              "precision", "recall", "f1", "n_mapped", "n",
-              "amp_noise", "dwell_std", "hard_negatives", "overlap",
-              "index_stride", "ref_bp", "train_steps", "unit_length", "tol_bp"]
+    header = ["timestamp", "method", "arm", "criterion", "refine", "refine_topk",
+              "precision", "recall", "f1", "n_mapped", "n", "fallback",
+              "err_median", "err_mean", "amp_noise", "dwell_std", "hard_negatives",
+              "overlap", "index_stride", "ref_bp", "unit_length", "tol_bp"]
     stride = resolve_index_stride(args)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    sg = result["signed"]
     write_header = not csv_path.exists()
     with open(csv_path, "a", newline="") as f:
         w = csv.writer(f)
         if write_header:
             w.writerow(header)
-        w.writerow([ts, method, args.refine, args.refine_topk,
-                    f"{m['precision']:.4f}", f"{m['recall']:.4f}", f"{m['f1']:.4f}",
-                    m["n_mapped"], m["n"], args.amp_noise, args.dwell_std,
-                    args.hard_negatives, args.overlap, stride, args.ref_bp,
-                    args.train_steps, args.unit_length, args.tol_bp])
-    print(f"[info] appended metrics -> {csv_path}", flush=True)
+        for arm, ((p, r, f1), crit) in result["arms"].items():
+            mapped = result["refine_mapped"] if arm == "dtw-refine" else result["n"]
+            w.writerow([ts, method, arm, crit, args.refine, args.refine_topk,
+                        f"{p:.4f}", f"{r:.4f}", f"{f1:.4f}", mapped, result["n"],
+                        result["fallback"], f"{sg['median']:.1f}", f"{sg['mean']:.1f}",
+                        args.amp_noise, args.dwell_std, args.hard_negatives, args.overlap,
+                        stride, args.ref_bp, args.unit_length, args.tol_bp])
+    print(f"[info] appended {len(result['arms'])} arm rows -> {csv_path}", flush=True)
 
 
 def train_encoder(encoder, pooling, dataset, device, args):
@@ -625,21 +683,34 @@ def main():
         ("trained", rec_trained, mrr_trained),
     ])
 
-    # --- Step 2a: single mapping (DTW refinement) -> precision/recall/F1 ---
-    m = evaluate_single_mapping(store_t, eval_reads, reference_seq, pore_model, args)
-    print(f"\n======== {args.method_name} single mapping (refine={args.refine}"
-          f"{', topk=%d' % args.refine_topk if args.refine == 'dtw' else ''}) ========")
-    print(f"  precision={m['precision']*100:.1f}%  recall={m['recall']*100:.1f}%  "
-          f"F1={m['f1']*100:.1f}%   (mapped {m['n_mapped']}/{m['n']}, correct {m['correct']})")
-    print(f"  sanity: single-mapping recall vs retrieval recall@1 = "
-          f"{m['recall']*100:.1f}% vs {rec_trained[1]*100:.1f}%")
-    print("  (true_coord, selected_coord, covered?) samples:")
-    for tc, sc, ok in m["samples"]:
-        print(f"    true={tc:>9d}  sel={sc:>9d}  {'HIT' if ok else 'miss'}")
+    # --- Step 2a: three arms, each under its own criterion ---
+    res = evaluate_arms(store_t, eval_reads, reference_seq, pore_model, args)
+    print(f"\n======== {args.method_name} mapping arms (refine={args.refine}, "
+          f"topk={args.refine_topk}) ========")
+    for arm, ((p, r, f1), crit) in res["arms"].items():
+        mapped = res["refine_mapped"] if arm == "dtw-refine" else res["n"]
+        print(f"  {arm:<14s} [{crit:<8s}]  P={p*100:5.1f}%  R={r*100:5.1f}%  "
+              f"F1={f1*100:5.1f}%   (mapped {mapped}/{res['n']})")
+    print(f"  sanity: retrieval-top1 (_covers) should match recall@1 = {rec_trained[1]*100:.1f}%")
+    if args.refine == "dtw":
+        sg = res["signed"]
+        print(f"  [diag] refine signed err (rerank-correct subset): median={sg['median']:+.0f} "
+              f"mean={sg['mean']:+.1f} std={sg['std']:.0f} p10={sg['p10']:+.0f} p90={sg['p90']:+.0f}")
+        print(f"  [diag] err hist [<-15, -15..-5, -5..5, 5..15, >15]: {sg['hist']}")
+        print(f"  [diag] fallback rate: {res['fallback']}/{res['refine_mapped']} "
+              f"(should be ~0 after context fix)")
+        print("  (true, rerank_coord, refine_bp, rerank_ok, refine_ok) samples:")
+        for tc, rr, rf, rok, fok in res["samples"]:
+            print(f"    true={tc:>9d}  rerank={rr:>9d}({'H' if rok else '.'})  "
+                  f"refine={rf:>9d}({'H' if fok else '.'})")
+        rows = pr_curve(res["per_read"], res["n"])
+        print(f"  [PR curve, score={args.score_source}] threshold  n_mapped  P      R      F1")
+        for t, nm, p, r, f1 in rows:
+            print(f"    {t:>10.4f}  {nm:>7d}  {p*100:5.1f}  {r*100:5.1f}  {f1*100:5.1f}")
     print("================================================================")
 
     metrics_csv = args.metrics_csv or (Path(__file__).resolve().parent / "squiggleseek_metrics.csv")
-    append_metrics_csv(metrics_csv, args, args.method_name, m)
+    append_metrics_csv(metrics_csv, args, args.method_name, res)
 
 
 if __name__ == "__main__":

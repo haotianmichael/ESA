@@ -1,16 +1,19 @@
 """
-SquiggleSeek Step 2a — subsequence-DTW refinement to a bp-level single mapping.
+SquiggleSeek Step 2a — DTW roles, separated.
 
-Global DTW over near-duplicate stride-15 windows can only pick a *window coord*,
-whose ~±30 bp blur exceeds the tolerance (it actually hurt: 68% vs 97% top-1).
-Instead we use **subsequence DTW**: render the expected signal of the reference
-region spanned by the top-k candidates, align the query as a subsequence, and
-read off WHERE it best matches — giving a base-pair-precise start position
-(``region_start + offset``), not a window index.
+Two distinct DTW jobs, evaluated separately (do NOT merge into one number):
 
-Downsampling by ``samples_per_kmer`` (one point per k-mer) makes the alignment
-both fast (C-free but small matrices) and exact; empirically it recovers the
-true start to ~0 bp. Uses ``dtaidistance`` (no hand-written DTW).
+* ``dtw_rerank_one``  — pick the best CANDIDATE WINDOW among the top-k by global
+  DTW cost. Output is a window coord (judge with the window criterion _covers).
+* ``dtw_refine_one``  — subsequence-align the query into the reference region and
+  read off a base-pair-precise start. Output is a bp point estimate (judge with
+  the symmetric _within).
+
+Both compare in the signal domain: query current signal vs the reference's
+expected current signal (pore model). Downsample by ``samples_per_kmer`` (one
+point per k-mer) for speed + exactness. The refine context is sized to the
+query's own bp span (reads range ~212..1285 bp for ``-r 300``); a fixed 300 bp
+context truncated long reads and pushed the start downstream.
 """
 from __future__ import annotations
 
@@ -35,47 +38,79 @@ def _prep_for_dtw(signal: np.ndarray, ds: int) -> np.ndarray:
     return np.ascontiguousarray(x)
 
 
+def _est_bp(query_signal: np.ndarray, samples_per_kmer: int) -> int:
+    return max(1, int(round(len(query_signal) / samples_per_kmer)))
+
+
+def dtw_rerank_one(
+    query_signal: np.ndarray,
+    candidate_coords: List[int],
+    reference_seq: str,
+    pore_model,
+    ds: Optional[int] = None,
+) -> Tuple[Optional[int], float]:
+    """Pick the candidate window (coord) of minimum global DTW cost.
+
+    Each candidate's expected signal is rendered over the query's own bp span so
+    a long read is compared to an equally long reference span (not a fixed
+    300 bp window). Returns (best_coord, cost)."""
+    from dtaidistance import dtw
+
+    if not candidate_coords:
+        return None, float("inf")
+    spk = pore_model.samples_per_kmer
+    if not ds or ds <= 0:
+        ds = spk
+    est = _est_bp(query_signal, spk)
+    q = _prep_for_dtw(query_signal, ds)
+
+    best_coord, best_cost = None, float("inf")
+    for c in candidate_coords:
+        exp = pore_model.sequence_to_signal(reference_seq[c : c + est])
+        s = _prep_for_dtw(exp, ds)
+        cost = dtw.distance_fast(q, s, use_pruning=True)
+        if cost < best_cost:
+            best_cost, best_coord = cost, c
+    return best_coord, best_cost
+
+
 def dtw_refine_one(
     query_signal: np.ndarray,
     candidate_coords: List[int],
     reference_seq: str,
     pore_model,
-    unit_length: int,
     ds: Optional[int] = None,
     ctx_margin: int = 90,
-    max_ctx_bp: int = 1200,
-) -> Tuple[Optional[int], float]:
-    """Return (reported_start_bp, score=-dtw_cost) via subsequence alignment.
+) -> Tuple[Optional[int], float, bool]:
+    """Subsequence-align the query into the candidate region -> bp start.
 
-    The reference context spans all top-k candidate windows (+ ``ctx_margin``);
-    if that span is wider than ``max_ctx_bp`` (candidates multi-modal), it falls
-    back to a context anchored on the top-1 candidate.
-    """
+    Context is sized to the query's own bp span (+margin) so long reads are not
+    truncated. Returns (reported_start_bp, cost, fallback_triggered)."""
     from dtaidistance.subsequence.dtw import subsequence_alignment
 
     if not candidate_coords:
-        return None, float("-inf")
-
+        return None, float("inf"), True
     spk = pore_model.samples_per_kmer
     if not ds or ds <= 0:
         ds = spk
+    est = _est_bp(query_signal, spk)
 
     lo, hi = min(candidate_coords), max(candidate_coords)
     region_start = max(0, lo - ctx_margin)
-    region_end = min(len(reference_seq), hi + unit_length + ctx_margin)
-    if region_end - region_start > max_ctx_bp:
+    region_end = min(len(reference_seq), hi + est + ctx_margin)
+    cap = est * 2 + 2 * ctx_margin
+    if region_end - region_start > cap:  # candidates multi-modal: anchor on top-1
         c0 = candidate_coords[0]
         region_start = max(0, c0 - ctx_margin)
-        region_end = min(len(reference_seq), c0 + unit_length + ctx_margin)
+        region_end = min(len(reference_seq), c0 + est + ctx_margin)
 
     ctx_signal = pore_model.sequence_to_signal(reference_seq[region_start:region_end])
     q = _prep_for_dtw(query_signal, ds)
     s = _prep_for_dtw(ctx_signal, ds)
-    if s.shape[0] <= q.shape[0]:  # context must be longer than the query
-        return candidate_coords[0], float("-inf")
+    if s.shape[0] <= q.shape[0]:  # context still shorter than query -> fallback
+        return candidate_coords[0], float("inf"), True
 
     match = subsequence_alignment(q, s).best_match()
     bp_offset = int(round((match.segment[0] * ds) / spk))
     reported = region_start + bp_offset
-    cost = float(getattr(match, "value", 0.0))
-    return reported, -cost
+    return reported, float(getattr(match, "value", 0.0)), False

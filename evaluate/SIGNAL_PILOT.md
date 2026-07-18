@@ -211,8 +211,26 @@ f1, n_mapped, amp_noise, dwell_std, … — the unified head-to-head schema that
 /2c and the noise-sweep driver will reuse). `--refine none` reports the top-1
 retrieval unchanged.
 
-Validation gates: single-mapping recall ≈ (≥) retrieval recall@1; printed
-(true, selected) pairs are close; `--refine none` matches prior behavior.
+**Step 2a criterion fix (three arms, separate criteria).** The earlier "DTW
+hurts" verdict compared a bp point estimate against a *window* criterion. Fixed:
+
+- `_within(sel,true,tol) = |sel-true|<=tol` for **bp point estimates**; `_covers`
+  stays for **window coords**. Never mixed; each arm prints its criterion.
+- Three arms reported separately (CSV has `arm` + `criterion` columns):
+  `retrieval-top1` (window coord, `_covers`), `dtw-rerank` (DTW-chosen candidate
+  coord, `_covers` — the fair "is DTW a good reranker?" comparison), `dtw-refine`
+  (bp point estimate, `_within`).
+- DTW refine context is sized to the **query's own bp span** (`len(sig)/samples_
+  per_kmer`), not a fixed 300 bp — long reads (~212..1285 bp for `-r 300`) were
+  truncated, pushing the start downstream. Prints the fallback rate and the
+  signed `(refine-true)` error distribution + a 5-bin histogram.
+- `--map_threshold` / `--score_source cosine|dtw`: emits a **precision-recall
+  curve** (sweep) so F1 is comparable to RawHash/minimap2 (which reject
+  low-confidence reads). `--map_threshold None` = map all (unchanged behavior).
+
+Validation gates: `retrieval-top1` under `_covers` must equal the prior recall@1
+(97.0%); after the context fix the fallback rate ≈ 0 and the signed-error median
+moves toward 0; `--refine none` matches prior behavior.
 
 Steps 2b (cascade basecall→minimap2 + oracle) and 2c (RawHash) are **not yet
 implemented** — pending confirmation of 2a's P/R/F1.
