@@ -75,13 +75,15 @@ def builtin_pafstats(truth_paf, tool_paf, require_strand=True):
             tp += 1
         else:
             fp += 1
-    for q in tool:
-        if q not in truth:
-            fp += 1
+    # Reads the tool mapped that are NOT in the truth set (e.g. reverse-strand
+    # reads excluded by --forward_only) are OUTSIDE the evaluation universe.
+    # They are ignored, not counted as FP — the truth PAF defines the read set.
+    extra = sum(1 for q in tool if q not in truth)
     p = tp / (tp + fp) if (tp + fp) else 0.0
     r = tp / (tp + fn) if (tp + fn) else 0.0
     f = 2 * p * r / (p + r) if (p + r) else 0.0
-    return {"tp": tp, "fp": fp, "fn": fn, "precision": p, "recall": r, "f1": f}
+    return {"tp": tp, "fp": fp, "fn": fn, "extra": extra,
+            "precision": p, "recall": r, "f1": f}
 
 
 def _find(pattern, text, cast=float):
@@ -158,14 +160,16 @@ def main():
         print("parsed:", m, flush=True)
         rows.append((name, m))
 
-    print("\n================ Step 2c head-to-head (uncalled pafstats) ================")
-    print(f"  {'method':<16s} {'TP':>7} {'FP':>7} {'FN':>7} {'P':>7} {'R':>7} {'F1':>7}")
+    print("\n================ Step 2c head-to-head (locus criterion) ================")
+    print(f"  {'method':<16s} {'TP':>7} {'FP':>7} {'FN':>7} {'extra':>7} {'P':>7} {'R':>7} {'F1':>7}")
     for name, m in rows:
         def pct(x):
             return f"{x*100:6.1f}" if isinstance(x, float) else "   n/a"
         print(f"  {name:<16s} {str(m['tp']):>7} {str(m['fp']):>7} {str(m['fn']):>7} "
-              f"{pct(m['precision'])} {pct(m['recall'])} {pct(m['f1'])}")
-    print("=========================================================================")
+              f"{str(m.get('extra', '-')):>7} {pct(m['precision'])} {pct(m['recall'])} {pct(m['f1'])}")
+    print("=======================================================================")
+    print("(extra = tool mappings outside the truth set, e.g. reverse-strand reads "
+          "when SquiggleSeek is forward-only; ignored, not counted as FP.)")
     print("(If any value is n/a, paste the raw pafstats block above and I'll fix the regex.)")
 
     csv_path = Path(args.csv) if args.csv else Path(__file__).resolve().parent / "head2head_pafstats.csv"
