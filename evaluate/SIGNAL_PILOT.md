@@ -258,4 +258,21 @@ printed and appended to `evaluate/squiggleseek_head2head.csv`
 sweep material (vary `--amp_noise` / `--dwell_std`, `--load_encoder` to skip
 retraining).
 
-Step 2c (RawHash) is **not yet implemented** — pending 2b's noise curve.
+### Step 2c — RawHash2 head-to-head (uncalled pafstats)
+
+Both tools emit PAF; `uncalled pafstats` (the RawHash-family standard) scores
+them against a squigulator-truth PAF — no custom `_covers`, so the numbers are
+defensible. Main arm is `retrieval-top1` (`--refine none`): pure seeding vs
+RawHash2's pure hash seeding.
+
+- `--paf_out_dir DIR`: writes `ground_truth.paf` (true coords from the read id),
+  `squiggleseek.paf` (retrieval-top1; MAPQ from the cosine score; reads below
+  `--map_threshold` omitted → counted FN), and copies `ref.fasta` + `reads.blow5`
+  so RawHash2 runs on the identical inputs (coordinate-matched).
+- `evaluate/rawhash_compare.py` runs pafstats on each tool PAF, parses
+  TP/FP/FN/P/R/F1, prints a side-by-side table, self-checks truth-vs-truth
+  (must be ~100%), and appends `evaluate/head2head_pafstats.csv`.
+
+RawHash2 index/map use the ONT R9 6-mer model (same table squigulator uses).
+This is an away game (RawHash's hash assumption holds exactly on simulated
+signal); report honestly.

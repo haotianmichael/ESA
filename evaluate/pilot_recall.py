@@ -54,6 +54,7 @@ from upsert_signal import read_single_fasta, build_signal_reference_index  # noq
 from signal_faiss_store import SignalFaissStore  # noqa: E402
 from refine import dtw_refine_one, dtw_rerank_one  # noqa: E402
 from baselines_cascade import cascade_oracle_positions, cascade_real_positions  # noqa: E402
+from paf_io import write_ground_truth_paf, write_mapping_paf, mapq_from_scores  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -162,6 +163,11 @@ def parse_args():
     p.add_argument("--head2head_csv", type=str, default=None,
                    help="CSV for the SquiggleSeek/cascade head-to-head (default: "
                         "evaluate/squiggleseek_head2head.csv).")
+
+    # --- Step 2c: emit PAFs for the RawHash head-to-head (uncalled pafstats) ---
+    p.add_argument("--paf_out_dir", type=str, default=None,
+                   help="If set, write ground_truth.paf + squiggleseek.paf (retrieval-top1) here, "
+                        "plus copies of ref.fasta and reads.blow5 (feed both to rawhash2).")
     return p.parse_args()
 
 
@@ -406,6 +412,47 @@ def _prf(correct, mapped, n):
     recall = correct / n if n else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
     return precision, recall, f1
+
+
+def emit_pafs(store, eval_reads, reference_seq, args, out_dir, squig_fasta, eval_blow5):
+    """Write ground_truth.paf + squiggleseek.paf (retrieval-top1) and copy the
+    ref.fasta / reads.blow5 so RawHash2 runs on the identical inputs (Step 2c)."""
+    import shutil
+    os.makedirs(out_dir, exist_ok=True)
+    spk = args.samples_per_kmer
+
+    ref_out = os.path.join(out_dir, "ref.fasta")
+    shutil.copy(squig_fasta, ref_out)
+    blow5_out = os.path.join(out_dir, "reads.blow5")
+    if os.path.exists(eval_blow5):
+        shutil.copy(eval_blow5, blow5_out)
+
+    write_ground_truth_paf(eval_reads, reference_seq, spk,
+                           os.path.join(out_dir, "ground_truth.paf"))
+
+    # SquiggleSeek main arm = retrieval-top1 (pure seeding, vs RawHash pure seeding)
+    signals = [r.signal for r in eval_reads]
+    coords = [r.reference_start for r in eval_reads]
+    results = store.query_batch(signals, coords, top_k=1)
+    triples = []
+    for r, res in zip(eval_reads, results):
+        if not res["matches"]:
+            continue
+        triples.append((r, res["matches"][0]["metadata"]["coord"],
+                        float(res["matches"][0]["score"])))
+    mapqs = mapq_from_scores([s for _, _, s in triples])
+    entries = []
+    for (r, pos, score), mq in zip(triples, mapqs):
+        if args.map_threshold is not None and score < args.map_threshold:
+            continue  # below threshold -> unmapped (absent from PAF -> FN)
+        entries.append((r, pos, mq))
+    write_mapping_paf(entries, reference_seq, spk, os.path.join(out_dir, "squiggleseek.paf"))
+
+    print(f"[paf] out_dir = {out_dir}", flush=True)
+    print(f"[paf]   ref.fasta   = {ref_out}", flush=True)
+    print(f"[paf]   reads.blow5 = {blow5_out}  (feed this SAME blow5 to rawhash2)", flush=True)
+    print(f"[paf]   ground_truth.paf, squiggleseek.paf "
+          f"({len(entries)}/{len(eval_reads)} mapped)", flush=True)
 
 
 def score_positions(positions, eval_reads, unit_length, tol_bp):
@@ -795,6 +842,11 @@ def main():
 
     metrics_csv = args.metrics_csv or (Path(__file__).resolve().parent / "squiggleseek_metrics.csv")
     append_metrics_csv(metrics_csv, args, args.method_name, res)
+
+    # --- Step 2c: emit PAFs for the RawHash head-to-head ---
+    if args.paf_out_dir:
+        emit_pafs(store_t, eval_reads, reference_seq, args, args.paf_out_dir,
+                  squig_fasta, eval_blow5)
 
     # --- Step 2b: cascade baselines, head-to-head under the same criterion ---
     if args.baseline == "cascade":
