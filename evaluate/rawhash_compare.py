@@ -49,7 +49,13 @@ def _read_paf(path):
             c = line.rstrip("\n").split("\t")
             if len(c) < 12:
                 continue
-            q, strand, tname, ts, te = c[0], c[4], c[5], int(c[7]), int(c[8])
+            q, strand, tname = c[0], c[4], c[5]
+            if tname == "*" or strand == "*":
+                continue  # PAF unmapped record -> treat read as unmapped (FN)
+            try:
+                ts, te = int(c[7]), int(c[8])
+            except ValueError:
+                continue
             if q not in m:  # keep the first (primary) record per read
                 m[q] = (tname, ts, te, strand)
     return m
