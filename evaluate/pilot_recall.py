@@ -380,6 +380,27 @@ def load_encoder(path, device, args):
     return model, cfg
 
 
+def _csv_needs_header(csv_path, header):
+    """True if we should write ``header``. If the file exists with a DIFFERENT
+    header (schema changed across versions), archive it to .bak and start fresh
+    so one file never mixes two schemas (which misaligns the columns)."""
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        return True
+    with open(csv_path) as f:
+        first = f.readline().rstrip("\r\n")
+    if first == ",".join(str(h) for h in header):
+        return False
+    bak = csv_path.with_suffix(csv_path.suffix + ".bak")
+    i = 1
+    while bak.exists():
+        bak = csv_path.with_suffix(csv_path.suffix + f".bak{i}")
+        i += 1
+    csv_path.rename(bak)
+    print(f"[info] {csv_path.name} schema changed; archived old file -> {bak.name}", flush=True)
+    return True
+
+
 def _prf(correct, mapped, n):
     precision = correct / mapped if mapped else 0.0
     recall = correct / n if n else 0.0
@@ -411,7 +432,7 @@ def append_head2head_csv(csv_path, args, rows):
     header = ["timestamp", "method", "amp_noise", "dwell_std", "precision", "recall",
               "f1", "n_mapped", "n", "ref_bp", "tol_bp", "n_query"]
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    write_header = not csv_path.exists()
+    write_header = _csv_needs_header(csv_path, header)
     with open(csv_path, "a", newline="") as f:
         w = csv.writer(f)
         if write_header:
@@ -523,7 +544,7 @@ def append_metrics_csv(csv_path, args, method, result):
     stride = resolve_index_stride(args)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     sg = result["signed"]
-    write_header = not csv_path.exists()
+    write_header = _csv_needs_header(csv_path, header)
     with open(csv_path, "a", newline="") as f:
         w = csv.writer(f)
         if write_header:
@@ -631,7 +652,7 @@ def append_results_csv(csv_path, args, topk_list, rows):
     stride = resolve_index_stride(args)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    write_header = not csv_path.exists()
+    write_header = _csv_needs_header(csv_path, header)
     with open(csv_path, "a", newline="") as f:
         w = csv.writer(f)
         if write_header:
