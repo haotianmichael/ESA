@@ -31,6 +31,7 @@ class SignalReadAndRef:
     id: str
     reference_name: Optional[str] = None
     strand: str = "+"           # '+' or '-' (PAF column 5)
+    reference_end: Optional[int] = None  # ground-truth end (bp); for the oracle sequence
 
 
 # --------------------------------------------------------------------------- #
@@ -105,6 +106,7 @@ def simulate_mapped_signals(
             continue
         tname = parts[-4]
         tstart = int(parts[-3])
+        tend = int(parts[-2])
         strand = parts[-1]
         reads.append(
             SignalReadAndRef(
@@ -113,6 +115,7 @@ def simulate_mapped_signals(
                 id=str(rid),
                 reference_name=tname,
                 strand=strand,
+                reference_end=tend,
             )
         )
     return reads
@@ -164,7 +167,8 @@ def simulate_synthetic_signals(
         signal = (clean + noise).astype(np.float32)
         reads.append(
             SignalReadAndRef(
-                signal=signal, reference_start=start, id=f"synth_{i}", reference_name="ref"
+                signal=signal, reference_start=start, id=f"synth_{i}", reference_name="ref",
+                reference_end=start + read_length_bp,
             )
         )
     return reads

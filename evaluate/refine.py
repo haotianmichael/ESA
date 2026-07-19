@@ -76,41 +76,43 @@ def dtw_rerank_one(
 
 def dtw_refine_one(
     query_signal: np.ndarray,
-    candidate_coords: List[int],
+    anchor_coord: int,
     reference_seq: str,
     pore_model,
+    unit_length: int,
     ds: Optional[int] = None,
     ctx_margin: int = 90,
 ) -> Tuple[Optional[int], float, bool]:
-    """Subsequence-align the query into the candidate region -> bp start.
+    """Subsequence-align the query into the context anchored on ``anchor_coord``
+    (the window the reranker already chose) -> bp start.
 
-    Context is sized to the query's own bp span (+margin) so long reads are not
-    truncated. Returns (reported_start_bp, cost, fallback_triggered)."""
+    Anchoring on the single reranked window avoids the top-20 "far decoy" that
+    used to drag region_start ~1e5 bp away (the mean/std blow-up). Context is
+    sized to the query's own bp span so long reads are not truncated. A fuse
+    rejects an implausible result (|refine - anchor| > unit_length), falling
+    back to the anchor. Returns (reported_start_bp, cost, fuse_triggered)."""
     from dtaidistance.subsequence.dtw import subsequence_alignment
 
-    if not candidate_coords:
+    if anchor_coord is None:
         return None, float("inf"), True
     spk = pore_model.samples_per_kmer
     if not ds or ds <= 0:
         ds = spk
     est = _est_bp(query_signal, spk)
 
-    lo, hi = min(candidate_coords), max(candidate_coords)
-    region_start = max(0, lo - ctx_margin)
-    region_end = min(len(reference_seq), hi + est + ctx_margin)
-    cap = est * 2 + 2 * ctx_margin
-    if region_end - region_start > cap:  # candidates multi-modal: anchor on top-1
-        c0 = candidate_coords[0]
-        region_start = max(0, c0 - ctx_margin)
-        region_end = min(len(reference_seq), c0 + est + ctx_margin)
+    region_start = max(0, anchor_coord - ctx_margin)
+    region_end = min(len(reference_seq), anchor_coord + est + ctx_margin)
 
     ctx_signal = pore_model.sequence_to_signal(reference_seq[region_start:region_end])
     q = _prep_for_dtw(query_signal, ds)
     s = _prep_for_dtw(ctx_signal, ds)
-    if s.shape[0] <= q.shape[0]:  # context still shorter than query -> fallback
-        return candidate_coords[0], float("inf"), True
+    if s.shape[0] <= q.shape[0]:  # context still shorter than query -> fall back
+        return anchor_coord, float("inf"), True
 
     match = subsequence_alignment(q, s).best_match()
     bp_offset = int(round((match.segment[0] * ds) / spk))
     reported = region_start + bp_offset
-    return reported, float(getattr(match, "value", 0.0)), False
+    cost = float(getattr(match, "value", 0.0))
+    if abs(reported - anchor_coord) > unit_length:  # fuse: implausible drift
+        return anchor_coord, cost, True
+    return reported, cost, False

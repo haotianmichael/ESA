@@ -53,6 +53,7 @@ from inference_signal import SignalEvalModel  # noqa: E402
 from upsert_signal import read_single_fasta, build_signal_reference_index  # noqa: E402
 from signal_faiss_store import SignalFaissStore  # noqa: E402
 from refine import dtw_refine_one, dtw_rerank_one  # noqa: E402
+from baselines_cascade import cascade_oracle_positions, cascade_real_positions  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -117,11 +118,12 @@ def parse_args():
     p.add_argument("--map_threshold", type=float, default=None,
                    help="Confidence threshold: reads scoring below it are 'unmapped' "
                         "(excluded from precision, still in recall denominator). None = map all.")
-    p.add_argument("--score_source", type=str, default="cosine", choices=["cosine", "dtw"],
-                   help="Confidence score for --map_threshold / the PR curve.")
+    p.add_argument("--score_source", type=str, default="dtw", choices=["cosine", "dtw"],
+                   help="Confidence score for --map_threshold / the PR curve (evaluated on "
+                        "the dtw-rerank arm; dtw = -DTW cost).")
 
     p.add_argument("--n_train", type=int, default=20000)
-    p.add_argument("--n_query", type=int, default=2000)
+    p.add_argument("--n_query", type=int, default=5000)
     p.add_argument("--read_length_bp", type=int, default=300)
 
     p.add_argument("--encoder_type", type=str, default="mamba",
@@ -143,6 +145,23 @@ def parse_args():
                    help="Use the synthetic pore-model simulator instead of squigulator.")
     p.add_argument("--squigulator_profile", type=str, default="dna-r9-min")
     p.add_argument("--seed", type=int, default=42)
+
+    # --- Step 2b: cascade baseline (basecall -> minimap2) ---
+    p.add_argument("--baseline", type=str, default="none", choices=["none", "cascade"],
+                   help="'cascade' = also run basecall->minimap2 baselines head-to-head.")
+    p.add_argument("--cascade_oracle", type=int, default=1,
+                   help="Run the oracle line (true reference substring -> minimap2). "
+                        "No basecaller needed; upper bound.")
+    p.add_argument("--cascade_real", type=int, default=0,
+                   help="Run the real line (basecall the query BLOW5 -> minimap2). "
+                        "Requires --basecaller_cmd.")
+    p.add_argument("--minimap2_bin", type=str, default="minimap2")
+    p.add_argument("--basecaller_cmd", type=str, default=None,
+                   help="Shell template with {blow5} and {fastq}, e.g. "
+                        "'buttery-eel -i {blow5} -o {fastq} -g <server> --config <cfg> --port 5000'.")
+    p.add_argument("--head2head_csv", type=str, default=None,
+                   help="CSV for the SquiggleSeek/cascade head-to-head (default: "
+                        "evaluate/squiggleseek_head2head.csv).")
     return p.parse_args()
 
 
@@ -368,6 +387,42 @@ def _prf(correct, mapped, n):
     return precision, recall, f1
 
 
+def score_positions(positions, eval_reads, unit_length, tol_bp):
+    """Score a list of reported start positions (None = unmapped) under _covers."""
+    n = len(eval_reads)
+    mapped = correct = 0
+    for pos, r in zip(positions, eval_reads):
+        if pos is None:
+            continue
+        mapped += 1
+        if _covers(pos, r.reference_start, unit_length, tol_bp):
+            correct += 1
+    p, r_, f = _prf(correct, mapped, n)
+    return {"precision": p, "recall": r_, "f1": f, "n_mapped": mapped, "n": n}
+
+
+def append_head2head_csv(csv_path, args, rows):
+    """rows: list of (method, metrics dict). One line per method."""
+    import csv
+    from datetime import datetime
+
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    header = ["timestamp", "method", "amp_noise", "dwell_std", "precision", "recall",
+              "f1", "n_mapped", "n", "ref_bp", "tol_bp", "n_query"]
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    write_header = not csv_path.exists()
+    with open(csv_path, "a", newline="") as f:
+        w = csv.writer(f)
+        if write_header:
+            w.writerow(header)
+        for method, m in rows:
+            w.writerow([ts, method, args.amp_noise, args.dwell_std,
+                        f"{m['precision']:.4f}", f"{m['recall']:.4f}", f"{m['f1']:.4f}",
+                        m["n_mapped"], m["n"], args.ref_bp, args.tol_bp, args.n_query])
+    print(f"[info] appended {len(rows)} head-to-head rows -> {csv_path}", flush=True)
+
+
 def evaluate_arms(store, eval_reads, reference_seq, pore_model, args):
     """Score three arms separately (never merged) under the RIGHT criterion:
 
@@ -399,21 +454,24 @@ def evaluate_arms(store, eval_reads, reference_seq, pore_model, args):
         if not do_dtw:
             per_read.append((cos1, top1_ok))
             continue
-        rr, _ = dtw_rerank_one(res["query"], cand[:topk], reference_seq, pore_model,
-                               ds=args.refine_dtw_ds)
+        # rerank first, then anchor the bp-refine on the reranked window (A1)
+        rr, rr_cost = dtw_rerank_one(res["query"], cand[:topk], reference_seq, pore_model,
+                                     ds=args.refine_dtw_ds)
         rr_ok = _covers(rr, true, args.unit_length, args.tol_bp)
         rerank_c += rr_ok
-        rf, rf_cost, fb = dtw_refine_one(res["query"], cand[:topk], reference_seq,
-                                         pore_model, ds=args.refine_dtw_ds,
-                                         ctx_margin=args.refine_ctx_margin)
-        fallback += int(fb)
+        rf, _, fuse = dtw_refine_one(res["query"], rr, reference_seq, pore_model,
+                                     args.unit_length, ds=args.refine_dtw_ds,
+                                     ctx_margin=args.refine_ctx_margin)
+        fallback += int(fuse)
         refine_mapped += 1
         rf_ok = _within(rf, true, args.tol_bp)
         refine_c += rf_ok
         if rr_ok:
             signed.append(rf - true)
-        score = (-rf_cost) if args.score_source == "dtw" else cos1
-        per_read.append((score, rf_ok))
+        # PR curve is evaluated on the dtw-rerank arm (main metric) with the
+        # DTW cost as confidence (A2); cosine kept for comparison.
+        score = (-rr_cost) if args.score_source == "dtw" else cos1
+        per_read.append((score, rr_ok))
         if len(samples) < 6:
             samples.append((true, rr, rf, rr_ok, rf_ok))
 
@@ -536,7 +594,8 @@ def write_single_record_fasta(seq, path):
     return path
 
 
-def simulate_reads(args, reference_seq, pore_model, n_reads, seed, tag, squig_fasta):
+def simulate_reads(args, reference_seq, pore_model, n_reads, seed, tag, squig_fasta,
+                   work_dir=None):
     if args.use_synthetic:
         reads = simulate_synthetic_signals(
             reference_seq=reference_seq, pore_model=pore_model,
@@ -547,6 +606,7 @@ def simulate_reads(args, reference_seq, pore_model, n_reads, seed, tag, squig_fa
             reference_genome=squig_fasta, n_reads=n_reads,
             read_length_bp=args.read_length_bp, profile=args.squigulator_profile,
             seed=seed, amp_noise=args.amp_noise, dwell_std=args.dwell_std,
+            work_dir=work_dir,
         )
     if args.forward_only:
         reads = [r for r in reads if r.strand == "+"]
@@ -614,9 +674,13 @@ def main():
         reference_seq, os.path.join(tempfile.mkdtemp(prefix="pilot_ref_"), "ref.fasta")
     )
 
-    # Query reads: disjoint train / eval sets.
+    # Query reads: disjoint train / eval sets. The eval reads use a persistent
+    # work dir so their BLOW5 survives for the cascade-real basecaller.
+    eval_work_dir = tempfile.mkdtemp(prefix="pilot_eval_")
+    eval_blow5 = os.path.join(eval_work_dir, "reads.blow5")
     train_reads = simulate_reads(args, reference_seq, pore_model, args.n_train, args.seed, "train", squig_fasta)
-    eval_reads = simulate_reads(args, reference_seq, pore_model, args.n_query, args.seed + 1, "eval", squig_fasta)
+    eval_reads = simulate_reads(args, reference_seq, pore_model, args.n_query, args.seed + 1, "eval", squig_fasta,
+                                work_dir=eval_work_dir)
     print(f"[info] simulated {len(train_reads)} train / {len(eval_reads)} eval reads "
           f"(forward_only={bool(args.forward_only)})")
     n_distinct = len(set(r.reference_start for r in eval_reads))
@@ -697,20 +761,61 @@ def main():
         print(f"  [diag] refine signed err (rerank-correct subset): median={sg['median']:+.0f} "
               f"mean={sg['mean']:+.1f} std={sg['std']:.0f} p10={sg['p10']:+.0f} p90={sg['p90']:+.0f}")
         print(f"  [diag] err hist [<-15, -15..-5, -5..5, 5..15, >15]: {sg['hist']}")
-        print(f"  [diag] fallback rate: {res['fallback']}/{res['refine_mapped']} "
-              f"(should be ~0 after context fix)")
+        print(f"  [diag] fuse triggered (|refine-rerank|>unit): {res['fallback']}/{res['refine_mapped']}")
         print("  (true, rerank_coord, refine_bp, rerank_ok, refine_ok) samples:")
         for tc, rr, rf, rok, fok in res["samples"]:
             print(f"    true={tc:>9d}  rerank={rr:>9d}({'H' if rok else '.'})  "
                   f"refine={rf:>9d}({'H' if fok else '.'})")
         rows = pr_curve(res["per_read"], res["n"])
-        print(f"  [PR curve, score={args.score_source}] threshold  n_mapped  P      R      F1")
+        print(f"  [PR curve on dtw-rerank, score={args.score_source}] threshold  n_mapped  P      R      F1")
         for t, nm, p, r, f1 in rows:
             print(f"    {t:>10.4f}  {nm:>7d}  {p*100:5.1f}  {r*100:5.1f}  {f1*100:5.1f}")
     print("================================================================")
 
     metrics_csv = args.metrics_csv or (Path(__file__).resolve().parent / "squiggleseek_metrics.csv")
     append_metrics_csv(metrics_csv, args, args.method_name, res)
+
+    # --- Step 2b: cascade baselines, head-to-head under the same criterion ---
+    if args.baseline == "cascade":
+        if "dtw-rerank" in res["arms"]:
+            (p, r, f1), _ = res["arms"]["dtw-rerank"]
+            ss_method = "SquiggleSeek(dtw-rerank)"
+        else:
+            (p, r, f1), _ = res["arms"]["retrieval-top1"]
+            ss_method = "SquiggleSeek(top1)"
+        ss_metrics = {"precision": p, "recall": r, "f1": f1,
+                      "n_mapped": res["n"], "n": res["n"]}
+
+        import tempfile
+        bwork = tempfile.mkdtemp(prefix="cascade_")
+        h2h = [(ss_method, ss_metrics)]
+
+        if args.cascade_oracle:
+            oracle_pos = cascade_oracle_positions(
+                eval_reads, reference_seq, squig_fasta, bwork, args.minimap2_bin)
+            h2h.append(("cascade-oracle",
+                        score_positions(oracle_pos, eval_reads, args.unit_length, args.tol_bp)))
+
+        if args.cascade_real:
+            if args.use_synthetic:
+                print("[warn] --cascade_real needs a real BLOW5; skipped under --use_synthetic.")
+            elif not args.basecaller_cmd:
+                print("[warn] --cascade_real needs --basecaller_cmd; skipped.")
+            else:
+                real_pos = cascade_real_positions(
+                    eval_reads, eval_blow5, squig_fasta, bwork,
+                    args.basecaller_cmd, args.minimap2_bin)
+                h2h.append(("cascade-real",
+                            score_positions(real_pos, eval_reads, args.unit_length, args.tol_bp)))
+
+        print("\n======== Step 2b head-to-head (_covers, tol +/-%dbp, amp_noise=%s dwell_std=%s) ========"
+              % (args.tol_bp, args.amp_noise, args.dwell_std))
+        for method, m in h2h:
+            print(f"  {method:<24s}  P={m['precision']*100:5.1f}%  R={m['recall']*100:5.1f}%  "
+                  f"F1={m['f1']*100:5.1f}%   (mapped {m['n_mapped']}/{m['n']})")
+        print("=================================================================")
+        h2h_csv = args.head2head_csv or (Path(__file__).resolve().parent / "squiggleseek_head2head.csv")
+        append_head2head_csv(h2h_csv, args, h2h)
 
 
 if __name__ == "__main__":

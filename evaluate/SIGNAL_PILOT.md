@@ -232,5 +232,30 @@ Validation gates: `retrieval-top1` under `_covers` must equal the prior recall@1
 (97.0%); after the context fix the fallback rate ≈ 0 and the signed-error median
 moves toward 0; `--refine none` matches prior behavior.
 
-Steps 2b (cascade basecall→minimap2 + oracle) and 2c (RawHash) are **not yet
-implemented** — pending confirmation of 2a's P/R/F1.
+**Step 2a follow-ups (A1/A2/A3):** the bp-refine now anchors its context on the
+window the reranker already chose (kills the far-decoy outliers; adds a fuse
+`|refine-rerank|>unit_length` → fall back to the rerank coord); the PR curve is
+evaluated on the **dtw-rerank** arm with `-DTW cost` as the score
+(`--score_source dtw` default); `--n_query` default raised to 5000.
+
+### Step 2b — cascade baseline (basecall → minimap2)
+
+On the SAME query reads, scored by the same read-ID truth + `_covers`:
+
+- **cascade-oracle** (`--baseline cascade --cascade_oracle 1`, default on): the
+  read's true reference substring (from the read ID; revcomp for `-`) → minimap2
+  → primary `reference_start`. No basecaller; an upper bound that should not
+  degrade with noise. Needs only **minimap2** + **pysam**.
+- **cascade-real** (`--cascade_real 1 --basecaller_cmd "..."`): basecall the query
+  BLOW5 with buttery-eel (template with `{blow5}`/`{fastq}`) → minimap2. Needs a
+  basecaller; run oracle first.
+
+minimap2's reference is the same single-record FASTA fed to squigulator, so
+coordinates match the truth. Unmapped reads: excluded from precision, kept in the
+recall denominator (RawHash-style), so F1 is comparable. Head-to-head P/R/F1 is
+printed and appended to `evaluate/squiggleseek_head2head.csv`
+(method, amp_noise, dwell_std, precision, recall, f1, n_mapped) — the E1 noise-
+sweep material (vary `--amp_noise` / `--dwell_std`, `--load_encoder` to skip
+retraining).
+
+Step 2c (RawHash) is **not yet implemented** — pending 2b's noise curve.
