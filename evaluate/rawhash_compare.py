@@ -34,6 +34,50 @@ def run_pafstats(uncalled_bin, truth_paf, tool_paf):
     return proc.stderr
 
 
+# --------------------------------------------------------------------------- #
+# Built-in pafstats-equivalent scorer (no external tool needed).
+# Rule: match reads by qname; a tool mapping is a true positive if it is on the
+# same contig+strand as the truth and its reference interval OVERLAPS the truth
+# interval (the standard "mapped to the right locus"). Reads absent from the tool
+# PAF are false negatives (unmapped). This mirrors UNCALLED pafstats' locus
+# criterion so we are not inventing a window-based measure.
+# --------------------------------------------------------------------------- #
+def _read_paf(path):
+    m = {}
+    with open(path) as f:
+        for line in f:
+            c = line.rstrip("\n").split("\t")
+            if len(c) < 12:
+                continue
+            q, strand, tname, ts, te = c[0], c[4], c[5], int(c[7]), int(c[8])
+            if q not in m:  # keep the first (primary) record per read
+                m[q] = (tname, ts, te, strand)
+    return m
+
+
+def builtin_pafstats(truth_paf, tool_paf, require_strand=True):
+    truth = _read_paf(truth_paf)
+    tool = _read_paf(tool_paf)
+    tp = fp = fn = 0
+    for q, (tn, ts, te, st) in truth.items():
+        if q not in tool:
+            fn += 1
+            continue
+        tn2, ts2, te2, st2 = tool[q]
+        overlap = tn2 == tn and max(ts, ts2) < min(te, te2)
+        if overlap and (not require_strand or st2 == st):
+            tp += 1
+        else:
+            fp += 1
+    for q in tool:
+        if q not in truth:
+            fp += 1
+    p = tp / (tp + fp) if (tp + fp) else 0.0
+    r = tp / (tp + fn) if (tp + fn) else 0.0
+    f = 2 * p * r / (p + r) if (p + r) else 0.0
+    return {"tp": tp, "fp": fp, "fn": fn, "precision": p, "recall": r, "f1": f}
+
+
 def _find(pattern, text, cast=float):
     m = re.search(pattern, text, re.IGNORECASE)
     return cast(m.group(1)) if m else None
@@ -67,6 +111,11 @@ def parse_args():
     ap.add_argument("--paf", action="append", default=[], metavar="NAME=path.paf",
                     help="tool PAF as NAME=path (repeatable), e.g. SquiggleSeek=ss.paf")
     ap.add_argument("--uncalled", default="uncalled")
+    ap.add_argument("--scorer", default="builtin", choices=["builtin", "pafstats"],
+                    help="'builtin' = internal pafstats-equivalent locus scorer (no external "
+                         "tool); 'pafstats' = shell out to `uncalled pafstats`.")
+    ap.add_argument("--ignore_strand", action="store_true",
+                    help="builtin scorer: do not require the strand to match.")
     ap.add_argument("--csv", default=None, help="default: evaluate/head2head_pafstats.csv")
     ap.add_argument("--amp_noise", default="default")
     ap.add_argument("--dwell_std", default="")
@@ -75,24 +124,31 @@ def parse_args():
     return ap.parse_args()
 
 
+def score_one(args, truth, tool):
+    if args.scorer == "builtin":
+        return builtin_pafstats(truth, tool, require_strand=not args.ignore_strand)
+    raw = run_pafstats(args.uncalled, truth, tool)
+    print(raw)
+    return parse_pafstats(raw)
+
+
 def main():
     args = parse_args()
+    print(f"[scorer] {args.scorer}"
+          + ("" if args.scorer == "builtin" else f" (uncalled={args.uncalled})"), flush=True)
 
     # gate 1: truth vs truth must be ~100%
-    print("=== self-check: pafstats(truth, truth) — expect ~100% ===", flush=True)
-    raw = run_pafstats(args.uncalled, args.truth, args.truth)
-    print(raw)
-    print("parsed:", parse_pafstats(raw), flush=True)
+    print("=== self-check: score(truth, truth) — expect P=R=F1=100%, FP=FN=0 ===", flush=True)
+    sc = score_one(args, args.truth, args.truth)
+    print("self-check:", sc, flush=True)
 
     rows = []
     for spec in args.paf:
         if "=" not in spec:
             sys.exit(f"--paf must be NAME=path, got: {spec}")
         name, path = spec.split("=", 1)
-        print(f"\n=== pafstats: {name}  ({path}) ===", flush=True)
-        raw = run_pafstats(args.uncalled, args.truth, path)
-        print(raw)
-        m = parse_pafstats(raw)
+        print(f"\n=== score: {name}  ({path}) ===", flush=True)
+        m = score_one(args, args.truth, path)
         print("parsed:", m, flush=True)
         rows.append((name, m))
 
