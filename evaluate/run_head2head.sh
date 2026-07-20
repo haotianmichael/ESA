@@ -30,6 +30,12 @@ if [ -z "${RAWHASH2:-}" ]; then
               find "$BASE/Rawhash2" -maxdepth 4 -type f -name rawhash2 2>/dev/null | head -1)"
   RAWHASH2="${RAWHASH2:-rawhash2}"
 fi
+# RawHash2 needs a pore model to build its index from a FASTA. Prefer its own
+# official R9 model (don't tune the opponent's config); fall back to ours.
+if [ -z "${RAWHASH_PORE:-}" ]; then
+  RAWHASH_PORE="$(find "$BASE/Rawhash2" -maxdepth 6 -type f -name 'template_median68pA.model' 2>/dev/null | head -1)"
+  RAWHASH_PORE="${RAWHASH_PORE:-$PORE_MODEL_PATH}"
+fi
 
 REPO="${REPO:-$(cd "$(dirname "$0")/.." && pwd)}"           # repo root (auto)
 OUT="${OUT:-$REPO/head2head_out}"
@@ -102,25 +108,31 @@ fi
 
 # -----------------------------------------------------------------------------
 say "2. pilot — index (both strands) + train + export PAFs"
-PILOT_ARGS=(
-  --reference_fasta "$REF_FA"
-  --pore_model "$PORE_MODEL_PATH"
-  --ref_bp 0
-  --refine none
-  --n_train "$N_TRAIN" --n_query "$N_QUERY"
-  --batch_size "$BATCH_SIZE" --hard_negatives "$HARD_NEG"
-  --seed "$SEED"
-  --paf_out_dir "$OUT"
-)
-echo "batch_size=$BATCH_SIZE  hard_negatives=$HARD_NEG  PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF"
-if [ -n "$LOAD_ENCODER" ] && [ -f "$LOAD_ENCODER" ]; then
-  PILOT_ARGS+=( --load_encoder "$LOAD_ENCODER" )
-  echo "loading encoder: $LOAD_ENCODER (training skipped)"
+if [ -s "$OUT/ground_truth.paf" ] && [ -s "$OUT/squiggleseek.paf" ] && [ -s "$OUT/reads.blow5" ] \
+   && [ "${FORCE_PILOT:-0}" != "1" ]; then
+  echo "reuse existing pilot outputs (ground_truth.paf / squiggleseek.paf / reads.blow5)."
+  echo "  -> skipping train+index+simulate. Set FORCE_PILOT=1 to redo the pilot."
 else
-  PILOT_ARGS+=( --save_encoder "$SAVE_ENCODER" )
-  echo "training a fresh encoder -> $SAVE_ENCODER"
+  PILOT_ARGS=(
+    --reference_fasta "$REF_FA"
+    --pore_model "$PORE_MODEL_PATH"
+    --ref_bp 0
+    --refine none
+    --n_train "$N_TRAIN" --n_query "$N_QUERY"
+    --batch_size "$BATCH_SIZE" --hard_negatives "$HARD_NEG"
+    --seed "$SEED"
+    --paf_out_dir "$OUT"
+  )
+  echo "batch_size=$BATCH_SIZE  hard_negatives=$HARD_NEG  PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF"
+  if [ -n "$LOAD_ENCODER" ] && [ -f "$LOAD_ENCODER" ]; then
+    PILOT_ARGS+=( --load_encoder "$LOAD_ENCODER" )
+    echo "loading encoder: $LOAD_ENCODER (training skipped)"
+  else
+    PILOT_ARGS+=( --save_encoder "$SAVE_ENCODER" )
+    echo "training a fresh encoder -> $SAVE_ENCODER"
+  fi
+  "$PYTHON" "$REPO/evaluate/pilot_recall.py" "${PILOT_ARGS[@]}" || fail "pilot_recall.py failed"
 fi
-"$PYTHON" "$REPO/evaluate/pilot_recall.py" "${PILOT_ARGS[@]}" || fail "pilot_recall.py failed"
 
 [ -s "$OUT/ground_truth.paf" ] || fail "ground_truth.paf not produced"
 [ -s "$OUT/squiggleseek.paf" ] || fail "squiggleseek.paf not produced"
@@ -131,7 +143,8 @@ echo "squiggleseek  : $(wc -l < "$OUT/squiggleseek.paf") mapped"
 # -----------------------------------------------------------------------------
 if [ "$HAVE_RAWHASH" -eq 1 ]; then
   say "3. RawHash2 on the identical reads.blow5 (preset=$RAWHASH_PRESET)"
-  "$RAWHASH2" -x "$RAWHASH_PRESET" -t "$THREADS" -d "$OUT/ref.idx" "$OUT/ref.fasta" \
+  echo "rawhash2 pore model: $RAWHASH_PORE"
+  "$RAWHASH2" -x "$RAWHASH_PRESET" -p "$RAWHASH_PORE" -t "$THREADS" -d "$OUT/ref.idx" "$OUT/ref.fasta" \
     || fail "rawhash2 index build failed"
   "$RAWHASH2" -x "$RAWHASH_PRESET" -t "$THREADS" "$OUT/ref.idx" "$OUT/reads.blow5" \
     > "$OUT/rawhash2.paf" || fail "rawhash2 mapping failed"
