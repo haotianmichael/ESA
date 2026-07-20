@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# =============================================================================
+# SquiggleSeek vs RawHash2 head-to-head — from scratch, one shot (Step 2c fix).
+#
+# Does EVERYTHING: generates a reference, simulates reads (squigulator), builds
+# the both-strand FAISS index + trains the encoder, exports PAFs, runs RawHash2
+# on the identical blow5, then scores with the builtin locus scorer AND the real
+# UNCALLED pafstats (pure-python, no HDF5 build). Work-point matching (PR sweep +
+# recall at RawHash's precision) is printed by rawhash_compare.
+#
+# Usage:
+#     export PATH=$PATH:/path/to/squigulator
+#     export PORE_MODEL_PATH=/path/to/r9_6mer_pore_model.txt
+#     nohup bash evaluate/run_head2head.sh > head2head_nohup.out 2>&1 &
+#
+# Everything below the config block is automatic. All logs -> $OUT/run.log; the
+# final numbers are also collected into $OUT/SUMMARY.txt.
+# =============================================================================
+set -u
+set -o pipefail
+
+# ---- config: edit to match your server (or override via env) ----------------
+REPO="${REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
+OUT="${OUT:-$REPO/head2head_out}"
+REF_BP="${REF_BP:-1000000}"          # reference length (bp); random, seed-fixed
+N_TRAIN="${N_TRAIN:-20000}"          # training reads
+N_QUERY="${N_QUERY:-5000}"           # eval/query reads (the head-to-head set)
+SEED="${SEED:-42}"
+PYTHON="${PYTHON:-python}"
+RAWHASH2="${RAWHASH2:-rawhash2}"     # rawhash2 binary (name on PATH or full path)
+RAWHASH_PRESET="${RAWHASH_PRESET:-sensitive}"  # check RawHash/test/ for the R9 preset
+THREADS="${THREADS:-32}"
+LOAD_ENCODER="${LOAD_ENCODER:-}"     # path to a saved encoder to skip training (optional)
+SAVE_ENCODER="${SAVE_ENCODER:-$OUT/encoder.pt}"
+# -----------------------------------------------------------------------------
+
+mkdir -p "$OUT"
+LOG="$OUT/run.log"
+SUMMARY="$OUT/SUMMARY.txt"
+: > "$SUMMARY"
+# tee all stdout/stderr to the run log
+exec > >(tee -a "$LOG") 2>&1
+
+say()  { echo -e "\n========== $* =========="; }
+fail() { echo "FATAL: $*"; exit 1; }
+
+say "0. environment check  ($(date))"
+echo "REPO=$REPO  OUT=$OUT  REF_BP=$REF_BP  N_QUERY=$N_QUERY  SEED=$SEED"
+command -v "$PYTHON" >/dev/null || fail "python not found ($PYTHON)"
+command -v squigulator >/dev/null || fail "squigulator not on PATH (export PATH=\$PATH:/path/to/squigulator)"
+[ -n "${PORE_MODEL_PATH:-}" ] || fail "PORE_MODEL_PATH not set (export PORE_MODEL_PATH=/path/to/r9_6mer_pore_model.txt)"
+[ -f "$PORE_MODEL_PATH" ]     || fail "pore model file missing: $PORE_MODEL_PATH"
+"$PYTHON" -c "import pyslow5" 2>/dev/null || fail "pyslow5 missing (pip install pyslow5)"
+HAVE_RAWHASH=1; command -v "$RAWHASH2" >/dev/null || { echo "WARN: rawhash2 not found ($RAWHASH2) — will still produce SquiggleSeek PAF; RawHash steps skipped."; HAVE_RAWHASH=0; }
+echo "squigulator: $(command -v squigulator)"
+echo "pore model : $PORE_MODEL_PATH"
+echo "rawhash2   : $(command -v "$RAWHASH2" 2>/dev/null || echo MISSING)"
+
+# -----------------------------------------------------------------------------
+say "1. reference + pafstats.py (from scratch)"
+REF_FA="$OUT/ref.fa"
+if [ ! -s "$REF_FA" ]; then
+  "$PYTHON" - "$REF_BP" "$SEED" "$REF_FA" <<'PY'
+import sys, random
+n, seed, path = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+random.seed(seed)
+seq = ''.join(random.choice('ACGT') for _ in range(n))
+with open(path, 'w') as f:
+    f.write('>ref\n')
+    for i in range(0, len(seq), 80):
+        f.write(seq[i:i+80] + '\n')
+print(f"wrote {path}: {len(seq)} bp")
+PY
+else
+  echo "reuse existing $REF_FA"
+fi
+
+PAFSTATS_PY="$OUT/pafstats.py"
+if [ ! -s "$PAFSTATS_PY" ]; then
+  URL="https://raw.githubusercontent.com/skovaka/UNCALLED/master/uncalled/pafstats.py"
+  ( command -v wget >/dev/null && wget -q -O "$PAFSTATS_PY" "$URL" ) \
+    || ( command -v curl >/dev/null && curl -sS -o "$PAFSTATS_PY" "$URL" ) \
+    || echo "WARN: could not download pafstats.py — the pafstats cross-check will be skipped."
+fi
+[ -s "$PAFSTATS_PY" ] && echo "pafstats.py ready: $PAFSTATS_PY" || { echo "no pafstats.py"; PAFSTATS_PY=""; }
+
+# -----------------------------------------------------------------------------
+say "2. pilot — index (both strands) + train + export PAFs"
+PILOT_ARGS=(
+  --reference_fasta "$REF_FA"
+  --pore_model "$PORE_MODEL_PATH"
+  --ref_bp 0
+  --refine none
+  --n_train "$N_TRAIN" --n_query "$N_QUERY"
+  --seed "$SEED"
+  --paf_out_dir "$OUT"
+)
+if [ -n "$LOAD_ENCODER" ] && [ -f "$LOAD_ENCODER" ]; then
+  PILOT_ARGS+=( --load_encoder "$LOAD_ENCODER" )
+  echo "loading encoder: $LOAD_ENCODER (training skipped)"
+else
+  PILOT_ARGS+=( --save_encoder "$SAVE_ENCODER" )
+  echo "training a fresh encoder -> $SAVE_ENCODER"
+fi
+"$PYTHON" "$REPO/evaluate/pilot_recall.py" "${PILOT_ARGS[@]}" || fail "pilot_recall.py failed"
+
+[ -s "$OUT/ground_truth.paf" ] || fail "ground_truth.paf not produced"
+[ -s "$OUT/squiggleseek.paf" ] || fail "squiggleseek.paf not produced"
+[ -s "$OUT/reads.blow5" ]      || fail "reads.blow5 not produced"
+echo "truth reads   : $(wc -l < "$OUT/ground_truth.paf")"
+echo "squiggleseek  : $(wc -l < "$OUT/squiggleseek.paf") mapped"
+
+# -----------------------------------------------------------------------------
+if [ "$HAVE_RAWHASH" -eq 1 ]; then
+  say "3. RawHash2 on the identical reads.blow5 (preset=$RAWHASH_PRESET)"
+  "$RAWHASH2" -x "$RAWHASH_PRESET" -t "$THREADS" -d "$OUT/ref.idx" "$OUT/ref.fasta" \
+    || fail "rawhash2 index build failed"
+  "$RAWHASH2" -x "$RAWHASH_PRESET" -t "$THREADS" "$OUT/ref.idx" "$OUT/reads.blow5" \
+    > "$OUT/rawhash2.paf" || fail "rawhash2 mapping failed"
+  echo "rawhash2 lines: $(wc -l < "$OUT/rawhash2.paf")"
+  PAF_ARGS=( --paf "SquiggleSeek=$OUT/squiggleseek.paf" --paf "RawHash2=$OUT/rawhash2.paf" )
+else
+  say "3. RawHash2 SKIPPED (binary missing) — scoring SquiggleSeek only"
+  PAF_ARGS=( --paf "SquiggleSeek=$OUT/squiggleseek.paf" )
+fi
+
+# -----------------------------------------------------------------------------
+run_scorer() {  # $1 = tag, rest = extra args
+  local tag="$1"; shift
+  say "score: $tag"
+  {
+    echo "########## SCORER: $tag ##########"
+    "$PYTHON" "$REPO/evaluate/rawhash_compare.py" \
+      --truth "$OUT/ground_truth.paf" \
+      "${PAF_ARGS[@]}" \
+      --sweep SquiggleSeek --match_to RawHash2 \
+      "$@"
+  } 2>&1 | tee -a "$SUMMARY"
+}
+
+say "4. scoring — builtin + real pafstats"
+run_scorer "builtin" --scorer builtin
+if [ -n "$PAFSTATS_PY" ]; then
+  run_scorer "pafstats (real UNCALLED, no HDF5)" --scorer pafstats --uncalled "$PAFSTATS_PY"
+else
+  echo "pafstats cross-check skipped (no pafstats.py)" | tee -a "$SUMMARY"
+fi
+
+# -----------------------------------------------------------------------------
+say "5. per-strand recall (forward vs reverse, builtin locus criterion)"
+"$PYTHON" - "$REPO/evaluate" "$OUT/ground_truth.paf" "$OUT/squiggleseek.paf" <<'PY' 2>&1 | tee -a "$SUMMARY"
+import sys, os
+sys.path.insert(0, sys.argv[1])
+from rawhash_compare import _read_paf, _score_truth_tool
+truth = _read_paf(sys.argv[2]); tool = _read_paf(sys.argv[3])
+for strand, label in (("+", "forward"), ("-", "reverse")):
+    sub = {q: v for q, v in truth.items() if v[3] == strand}
+    if not sub:
+        print(f"{label:8s}: no truth reads"); continue
+    m = _score_truth_tool(sub, tool, require_strand=True)
+    print(f"{label:8s}: n={len(sub):6d}  TP={m['tp']:6d}  FP={m['fp']:5d}  FN={m['fn']:5d}  "
+          f"P={m['precision']*100:5.1f}  R={m['recall']*100:5.1f}  F1={m['f1']*100:5.1f}")
+PY
+
+say "DONE  ($(date))"
+echo "full log : $LOG"
+echo "summary  : $SUMMARY"
+echo
+echo "==== collect these 3 things from $SUMMARY ===="
+echo "  A. work-point matched table + PR sweep points (per scorer)"
+echo "  B. builtin vs pafstats head-to-head tables side by side (should agree <1pp)"
+echo "  C. full both-strand head-to-head + 'extra' column, and per-strand recall (step 5)"
