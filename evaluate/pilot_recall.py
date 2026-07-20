@@ -78,9 +78,11 @@ def parse_args():
     p.add_argument("--index_stride", type=int, default=0,
                    help="Index tiling step; 0 = unit_length - overlap. Set to decouple "
                         "index density from --overlap if VRAM is tight.")
-    p.add_argument("--forward_only", type=int, default=1,
-                   help="1 = keep only '+'-strand reads (forward-only index). "
-                        "strand-aware dual-index is a later item.")
+    p.add_argument("--forward_only", type=int, default=0,
+                   help="1 = keep only '+'-strand reads. Default 0: both strands (the index "
+                        "carries revcomp windows tagged strand='-').")
+    p.add_argument("--both_strands", type=int, default=1,
+                   help="1 = index reverse-complement windows too (needed for '-' reads).")
 
     # --- hard-negative mining (Stage-1 precision lever) ---
     p.add_argument("--hard_negatives", type=int, default=8,
@@ -203,6 +205,7 @@ def build_store(signal_model, name, device, reference_seq, pore_model, args):
     build_signal_reference_index(
         reference_seq=reference_seq, pore_model=pore_model, signal_model=signal_model,
         store=store, unit_length=args.unit_length, stride=stride,
+        both_strands=bool(args.both_strands),
     )
     return store
 
@@ -430,29 +433,29 @@ def emit_pafs(store, eval_reads, reference_seq, args, out_dir, squig_fasta, eval
     write_ground_truth_paf(eval_reads, reference_seq, spk,
                            os.path.join(out_dir, "ground_truth.paf"))
 
-    # SquiggleSeek main arm = retrieval-top1 (pure seeding, vs RawHash pure seeding)
+    # SquiggleSeek main arm = retrieval-top1 (pure seeding, vs RawHash pure seeding).
+    # ALL reads are written with their cosine score as a tag; the confidence
+    # threshold sweep (work-point matching) happens in rawhash_compare.
     signals = [r.signal for r in eval_reads]
     coords = [r.reference_start for r in eval_reads]
     results = store.query_batch(signals, coords, top_k=1)
-    triples = []
+    quads = []
     for r, res in zip(eval_reads, results):
         if not res["matches"]:
             continue
-        triples.append((r, res["matches"][0]["metadata"]["coord"],
-                        float(res["matches"][0]["score"])))
-    mapqs = mapq_from_scores([s for _, _, s in triples])
-    entries = []
-    for (r, pos, score), mq in zip(triples, mapqs):
-        if args.map_threshold is not None and score < args.map_threshold:
-            continue  # below threshold -> unmapped (absent from PAF -> FN)
-        entries.append((r, pos, mq))
+        m0 = res["matches"][0]
+        strand = m0["metadata"].get("strand", "+")
+        quads.append((r, m0["metadata"]["coord"], strand, float(m0["score"])))
+    mapqs = mapq_from_scores([s for *_, s in quads])
+    entries = [(r, pos, mq, strand, score)
+               for (r, pos, strand, score), mq in zip(quads, mapqs)]
     write_mapping_paf(entries, reference_seq, spk, os.path.join(out_dir, "squiggleseek.paf"))
 
     print(f"[paf] out_dir = {out_dir}", flush=True)
     print(f"[paf]   ref.fasta   = {ref_out}", flush=True)
     print(f"[paf]   reads.blow5 = {blow5_out}  (feed this SAME blow5 to rawhash2)", flush=True)
-    print(f"[paf]   ground_truth.paf, squiggleseek.paf "
-          f"({len(entries)}/{len(eval_reads)} mapped)", flush=True)
+    print(f"[paf]   ground_truth.paf, squiggleseek.paf ({len(entries)}/{len(eval_reads)} mapped)",
+          flush=True)
 
 
 def score_positions(positions, eval_reads, unit_length, tol_bp):

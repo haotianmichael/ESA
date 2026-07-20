@@ -15,6 +15,13 @@ import numpy as np
 from tqdm import tqdm
 
 
+_COMP = str.maketrans("ACGTNacgtn", "TGCANtgcan")
+
+
+def revcomp(s: str) -> str:
+    return s.translate(_COMP)[::-1]
+
+
 def read_single_fasta(path: str) -> str:
     """Concatenate all sequence lines of a FASTA into one uppercase string."""
     seq_parts: List[str] = []
@@ -35,12 +42,17 @@ def build_signal_reference_index(
     stride: int = 150,
     namespace: str = "ref",
     encode_batch: int = 2048,
+    both_strands: bool = True,
 ):
     """Window the reference, embed expected signals, and populate ``store``.
 
     ``stride`` is the index tiling step (decoupled from training). A small
     stride (e.g. 15) removes the "best window not aligned to the read start"
     ceiling artifact at the cost of more windows.
+
+    ``both_strands``: also index the reverse-complement of each window (expected
+    signal of revcomp bases), tagged ``strand='-'`` at the same forward coord, so
+    reverse-strand reads can be mapped (index size doubles).
     """
     step = max(1, stride)
     starts = list(range(0, len(reference_seq) - unit_length + 1, step))
@@ -59,7 +71,10 @@ def build_signal_reference_index(
     for start in tqdm(starts, desc="reference windows"):
         bases = reference_seq[start : start + unit_length]
         buf_signals.append(pore_model.sequence_to_signal(bases))
-        buf_meta.append({"coord": start, "metadata": namespace, "text": ""})
+        buf_meta.append({"coord": start, "strand": "+", "metadata": namespace, "text": ""})
+        if both_strands:
+            buf_signals.append(pore_model.sequence_to_signal(revcomp(bases)))
+            buf_meta.append({"coord": start, "strand": "-", "metadata": namespace, "text": ""})
         if len(buf_signals) >= encode_batch:
             flush()
     flush()

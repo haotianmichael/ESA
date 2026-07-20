@@ -53,13 +53,15 @@ def write_ground_truth_paf(eval_reads, reference_seq, samples_per_kmer, path):
 
 
 def write_mapping_paf(entries: List[Tuple], reference_seq, samples_per_kmer, path):
-    """entries: list of (read, reported_tstart, mapq). Unmapped reads are simply
-    absent (so pafstats counts them as FN)."""
+    """entries: list of (read, reported_tstart, mapq, strand, score). The cosine
+    score is appended as a ``cs:f:`` tag so the head-to-head can sweep a
+    confidence threshold. Unmapped reads are simply absent (counted as FN)."""
     tlen = len(reference_seq)
     with open(path, "w") as f:
-        for r, tstart, mapq in entries:
+        for r, tstart, mapq, strand, score in entries:
             span = _read_span_bp(r, samples_per_kmer)
             tname = r.reference_name or "ref"
-            f.write(_paf_line(r.id, span, 0, span, "+", tname, tlen,
-                              tstart, tstart + span, span, span, mapq) + "\n")
+            line = _paf_line(r.id, span, 0, span, strand, tname, tlen,
+                             tstart, tstart + span, span, span, mapq)
+            f.write(f"{line}\tcs:f:{score:.6f}\n")
     return path

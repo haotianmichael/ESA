@@ -276,3 +276,69 @@ RawHash2's pure hash seeding.
 RawHash2 index/map use the ONT R9 6-mer model (same table squigulator uses).
 This is an away game (RawHash's hash assumption holds exactly on simulated
 signal); report honestly.
+
+### Step 2c fix — three fairness patches
+
+The first head-to-head had three methodology holes; all three are now closed in
+code (reuse files still untouched). Re-run pilot + rawhash2 + compare to redo it.
+
+1. **Work-point matching (Step 1).** SquiggleSeek reporting a locus for every
+   read gets recall=100% for free; RawHash withholds its low-confidence reads.
+   Those are different work-points, not a capability gap. `rawhash_compare.py`
+   now sweeps the cosine confidence on the SquiggleSeek PAF (`--sweep NAME`),
+   prints the full PR curve, and — given `--match_to NAME` — reports
+   **SquiggleSeek's recall at RawHash's precision** in a 3-row table
+   (`@all` / `@P>=RawHash` / `RawHash`). Known risk: the confidence score is a
+   weak discriminator, so recall at P=100% may collapse — reported as-is, not
+   hidden.
+2. **Real-scorer cross-check (Step 2).** The builtin locus scorer is validated
+   against the domain-standard tools. `--scorer pafstats` runs the *original*
+   UNCALLED `uncalled pafstats` (parses its 2×2 confusion-matrix output);
+   `--scorer mapeval` runs `paftools.js mapeval` (squigulator read IDs are
+   already in its truth format, needs `k8`). Run all three on the same PAFs; if
+   builtin agrees within <1pp it stays for fast iteration, but paper numbers come
+   from the standard tool. `uncalled4 != uncalled` — pafstats only exists in the
+   original UNCALLED.
+3. **Reverse-strand support (Step 3).** `upsert_signal.build_signal_reference_index`
+   now also indexes each window's revcomp (`strand='-'`, same forward coord),
+   doubling the index. `emit_pafs` reads the retrieved strand into the PAF strand
+   column. `--forward_only` now defaults to 0 (kept as a flag), so truth =
+   **all reads, both strands**. RawHash's `extra` should drop sharply (its
+   reverse mappings finally land in the truth set). Validation gate: reverse-strand
+   recall should be the same order as forward; if not, the revcomp expected-signal
+   direction or coord mapping is wrong.
+
+Commands:
+```bash
+# 1) re-run the pilot with reverse strand + PAF export (default both_strands=1)
+python evaluate/pilot_recall.py --reference_fasta ref.fa --pore_model r9.model \
+    --refine none --paf_out_dir /path/to/head2head_out \
+    --load_encoder /path/to/encoder.pt      # reuse the trained encoder
+
+# 2) run rawhash2 on the SAME blow5 the pilot exported
+rawhash2 -x sensitive -t 32 -d ref.idx head2head_out/ref.fasta   # or the R9 preset from RawHash/test/
+rawhash2 -x sensitive -t 32 ref.idx head2head_out/reads.blow5 > head2head_out/rawhash2.paf
+
+# 3) head-to-head with work-point matching + a real scorer
+python evaluate/rawhash_compare.py \
+    --truth head2head_out/ground_truth.paf \
+    --paf SquiggleSeek=head2head_out/squiggleseek.paf \
+    --paf RawHash2=head2head_out/rawhash2.paf \
+    --sweep SquiggleSeek --match_to RawHash2 \
+    --scorer builtin
+# then repeat with --scorer pafstats (needs UNCALLED) and --scorer mapeval (needs k8)
+```
+
+Install for the real scorers (do on your server; nothing auto-installed here):
+```bash
+# original UNCALLED pafstats
+pip3 install git+https://github.com/skovaka/UNCALLED.git --user
+pip install file-read-backwards          # known missing dep
+# OR paftools.js mapeval
+#   k8 runtime + paftools.js from the minimap2 repo (pass --k8 / --paftools if not on PATH)
+```
+
+Results to collect: (a) the 3-row work-point table + full PR-curve points;
+(b) the three-scorer consistency comparison (builtin vs pafstats vs mapeval on
+the same PAFs); (c) the full both-strand head-to-head table plus forward-only and
+reverse-only recall broken out.

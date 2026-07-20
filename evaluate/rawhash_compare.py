@@ -43,6 +43,8 @@ def run_pafstats(uncalled_bin, truth_paf, tool_paf):
 # criterion so we are not inventing a window-based measure.
 # --------------------------------------------------------------------------- #
 def _read_paf(path):
+    """qname -> (tname, tstart, tend, strand, score). score comes from a
+    ``cs:f:`` tag if present (SquiggleSeek), else +inf (always mapped)."""
     m = {}
     with open(path) as f:
         for line in f:
@@ -56,28 +58,33 @@ def _read_paf(path):
                 ts, te = int(c[7]), int(c[8])
             except ValueError:
                 continue
+            score = float("inf")
+            for tag in c[12:]:
+                if tag.startswith("cs:f:"):
+                    score = float(tag[5:])
+                    break
             if q not in m:  # keep the first (primary) record per read
-                m[q] = (tname, ts, te, strand)
+                m[q] = (tname, ts, te, strand, score)
     return m
 
 
-def builtin_pafstats(truth_paf, tool_paf, require_strand=True):
-    truth = _read_paf(truth_paf)
-    tool = _read_paf(tool_paf)
+def _score_truth_tool(truth, tool, require_strand=True, score_threshold=None):
+    """Score parsed truth/tool dicts. score_threshold: tool reads below it are
+    treated as unmapped (work-point matching)."""
     tp = fp = fn = 0
-    for q, (tn, ts, te, st) in truth.items():
+    for q, (tn, ts, te, st, _s) in truth.items():
         if q not in tool:
             fn += 1
             continue
-        tn2, ts2, te2, st2 = tool[q]
+        tn2, ts2, te2, st2, sc2 = tool[q]
+        if score_threshold is not None and sc2 < score_threshold:
+            fn += 1  # withheld -> unmapped
+            continue
         overlap = tn2 == tn and max(ts, ts2) < min(te, te2)
         if overlap and (not require_strand or st2 == st):
             tp += 1
         else:
             fp += 1
-    # Reads the tool mapped that are NOT in the truth set (e.g. reverse-strand
-    # reads excluded by --forward_only) are OUTSIDE the evaluation universe.
-    # They are ignored, not counted as FP — the truth PAF defines the read set.
     extra = sum(1 for q in tool if q not in truth)
     p = tp / (tp + fp) if (tp + fp) else 0.0
     r = tp / (tp + fn) if (tp + fn) else 0.0
@@ -86,44 +93,119 @@ def builtin_pafstats(truth_paf, tool_paf, require_strand=True):
             "precision": p, "recall": r, "f1": f}
 
 
+def builtin_pafstats(truth_paf, tool_paf, require_strand=True):
+    # Reads the tool mapped that are NOT in the truth set are OUTSIDE the
+    # evaluation universe (ignored as 'extra', not FP). The truth PAF defines it.
+    return _score_truth_tool(_read_paf(truth_paf), _read_paf(tool_paf), require_strand)
+
+
+def pr_sweep(truth_paf, tool_paf, require_strand=True, n_points=15):
+    """Sweep the confidence score threshold on a scored tool PAF -> PR curve.
+    Returns list of (threshold, tp, fp, fn, precision, recall, f1)."""
+    truth = _read_paf(truth_paf)
+    tool = _read_paf(tool_paf)
+    scores = sorted(s for (*_, s) in tool.values() if s != float("inf"))
+    if not scores:
+        m = _score_truth_tool(truth, tool, require_strand)
+        return [(float("-inf"), m["tp"], m["fp"], m["fn"], m["precision"], m["recall"], m["f1"])]
+    import numpy as np
+    thresholds = [float("-inf")] + [float(np.quantile(scores, q)) for q in np.linspace(0, 1, n_points)]
+    rows = []
+    for t in sorted(set(thresholds)):
+        m = _score_truth_tool(truth, tool, require_strand, score_threshold=t)
+        rows.append((t, m["tp"], m["fp"], m["fn"], m["precision"], m["recall"], m["f1"]))
+    return rows
+
+
+def recall_at_precision(sweep_rows, target_p):
+    """Among sweep rows meeting precision >= target_p, return the one with the
+    highest recall (i.e. the loosest threshold that still hits the precision)."""
+    ok = [r for r in sweep_rows if r[4] >= target_p]
+    if not ok:
+        return None
+    return max(ok, key=lambda r: r[5])
+
+
 def _find(pattern, text, cast=float):
     m = re.search(pattern, text, re.IGNORECASE)
     return cast(m.group(1)) if m else None
 
 
-def parse_pafstats(text):
-    """Tolerant parse of pafstats summary. Returns dict (values may be None)."""
-    d = {
-        "tp": _find(r"\b(?:TP|true[ _]?positives?)\D+(\d+)", text, int),
-        "fp": _find(r"\b(?:FP|false[ _]?positives?)\D+(\d+)", text, int),
-        "fn": _find(r"\b(?:FN|false[ _]?negatives?)\D+(\d+)", text, int),
-        "precision": _find(r"\b(?:precision|prec)\b\D+([\d.]+)", text),
-        "recall": _find(r"\b(?:recall|sensitivity)\b\D+([\d.]+)", text),
-        "f1": _find(r"\bF[-_ ]?1?(?:[ _]?score)?\b\D+([\d.]+)", text),
-    }
-    # derive P/R/F1 from counts if the summary didn't print them
-    tp, fp, fn = d["tp"], d["fp"], d["fn"]
-    if d["precision"] is None and tp is not None and fp is not None and (tp + fp):
-        d["precision"] = tp / (tp + fp)
-    if d["recall"] is None and tp is not None and fn is not None and (tp + fn):
-        d["recall"] = tp / (tp + fn)
-    if d["f1"] is None and d["precision"] and d["recall"] and (d["precision"] + d["recall"]):
-        p, r = d["precision"], d["recall"]
-        d["f1"] = 2 * p * r / (p + r)
+def _prf_from_counts(tp, fp, fn):
+    d = {"tp": tp, "fp": fp, "fn": fn, "extra": None,
+         "precision": None, "recall": None, "f1": None}
+    if None in (tp, fp, fn):
+        return d
+    d["precision"] = tp / (tp + fp) if (tp + fp) else 0.0
+    d["recall"] = tp / (tp + fn) if (tp + fn) else 0.0
+    p, r = d["precision"], d["recall"]
+    d["f1"] = 2 * p * r / (p + r) if (p + r) else 0.0
     return d
 
 
+def parse_pafstats(text):
+    """Parse UNCALLED pafstats' 2x2 confusion matrix (percentages of total reads):
+        Summary: N reads, ...
+                P      N
+           T  <TP%>  <TN%>
+           F  <FP%>  <FN%>
+    """
+    total = _find(r"Summary:\s*(\d+)\s*reads", text, int)
+
+    def row(letter):
+        m = re.search(rf"^\s*{letter}\s+([\d.]+)\s+([\d.]+)", text, re.MULTILINE)
+        return (float(m.group(1)), float(m.group(2))) if m else (None, None)
+
+    tp_pct, _tn_pct = row("T")
+    fp_pct, fn_pct = row("F")
+    if total is None or None in (tp_pct, fp_pct, fn_pct):
+        return {"tp": None, "fp": None, "fn": None, "extra": None,
+                "precision": None, "recall": None, "f1": None}
+    return _prf_from_counts(round(tp_pct / 100 * total),
+                            round(fp_pct / 100 * total),
+                            round(fn_pct / 100 * total))
+
+
+def run_mapeval(k8_bin, paftools_js, tool_paf, extra=""):
+    """minimap2 paftools.js mapeval — truth is encoded in the squigulator read
+    names, so no separate truth PAF is needed. Returns stdout text."""
+    cmd = f"{k8_bin} {paftools_js} mapeval {extra} {tool_paf}"
+    proc = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, text=True)
+    return proc.stdout
+
+
+def parse_mapeval(text):
+    """paftools mapeval prints cumulative rows; the final row's columns give
+    total mapped, wrong (error), and the error fraction. Tolerant: last data row."""
+    rows = []
+    for line in text.splitlines():
+        c = line.split()
+        if len(c) >= 4 and c[0] in ("Q", "U") and c[1].replace(".", "").isdigit():
+            rows.append(c)
+    # This format varies by version; echo raw and let the user confirm.
+    return {"tp": None, "fp": None, "fn": None, "extra": None,
+            "precision": None, "recall": None, "f1": None, "raw_rows": len(rows)}
+
+
 def parse_args():
-    ap = argparse.ArgumentParser(description="SquiggleSeek vs RawHash2 via uncalled pafstats")
+    ap = argparse.ArgumentParser(description="SquiggleSeek vs RawHash2 head-to-head")
     ap.add_argument("--truth", required=True, help="ground_truth.paf")
     ap.add_argument("--paf", action="append", default=[], metavar="NAME=path.paf",
                     help="tool PAF as NAME=path (repeatable), e.g. SquiggleSeek=ss.paf")
     ap.add_argument("--uncalled", default="uncalled")
-    ap.add_argument("--scorer", default="builtin", choices=["builtin", "pafstats"],
-                    help="'builtin' = internal pafstats-equivalent locus scorer (no external "
-                         "tool); 'pafstats' = shell out to `uncalled pafstats`.")
+    ap.add_argument("--scorer", default="builtin", choices=["builtin", "pafstats", "mapeval"],
+                    help="'builtin' = internal locus scorer; 'pafstats' = uncalled pafstats; "
+                         "'mapeval' = paftools.js mapeval.")
+    ap.add_argument("--k8", default="k8")
+    ap.add_argument("--paftools", default="paftools.js")
     ap.add_argument("--ignore_strand", action="store_true",
                     help="builtin scorer: do not require the strand to match.")
+    # work-point matching (Step 1)
+    ap.add_argument("--sweep", default=None, metavar="NAME",
+                    help="Tool name (must be a --paf whose PAF has cs:f scores) to PR-sweep.")
+    ap.add_argument("--match_to", default=None, metavar="NAME",
+                    help="Report --sweep tool's recall at the precision of this tool.")
     ap.add_argument("--csv", default=None, help="default: evaluate/head2head_pafstats.csv")
     ap.add_argument("--amp_noise", default="default")
     ap.add_argument("--dwell_std", default="")
@@ -135,26 +217,31 @@ def parse_args():
 def score_one(args, truth, tool):
     if args.scorer == "builtin":
         return builtin_pafstats(truth, tool, require_strand=not args.ignore_strand)
-    raw = run_pafstats(args.uncalled, truth, tool)
+    if args.scorer == "pafstats":
+        raw = run_pafstats(args.uncalled, truth, tool)
+        print(raw)
+        return parse_pafstats(raw)
+    raw = run_mapeval(args.k8, args.paftools, tool)  # mapeval (truth in read names)
     print(raw)
-    return parse_pafstats(raw)
+    return parse_mapeval(raw)
 
 
 def main():
     args = parse_args()
-    print(f"[scorer] {args.scorer}"
-          + ("" if args.scorer == "builtin" else f" (uncalled={args.uncalled})"), flush=True)
+    print(f"[scorer] {args.scorer}", flush=True)
 
-    # gate 1: truth vs truth must be ~100%
-    print("=== self-check: score(truth, truth) — expect P=R=F1=100%, FP=FN=0 ===", flush=True)
-    sc = score_one(args, args.truth, args.truth)
-    print("self-check:", sc, flush=True)
+    # gate 1: truth vs truth must be ~100% (builtin only; standard tools use read-name truth)
+    print("=== self-check: builtin(truth, truth) — expect P=R=F1=100%, FP=FN=0 ===", flush=True)
+    print("self-check:", builtin_pafstats(args.truth, args.truth,
+                                          require_strand=not args.ignore_strand), flush=True)
 
+    pafs = {}
     rows = []
     for spec in args.paf:
         if "=" not in spec:
             sys.exit(f"--paf must be NAME=path, got: {spec}")
         name, path = spec.split("=", 1)
+        pafs[name] = path
         print(f"\n=== score: {name}  ({path}) ===", flush=True)
         m = score_one(args, args.truth, path)
         print("parsed:", m, flush=True)
@@ -168,9 +255,37 @@ def main():
         print(f"  {name:<16s} {str(m['tp']):>7} {str(m['fp']):>7} {str(m['fn']):>7} "
               f"{str(m.get('extra', '-')):>7} {pct(m['precision'])} {pct(m['recall'])} {pct(m['f1'])}")
     print("=======================================================================")
-    print("(extra = tool mappings outside the truth set, e.g. reverse-strand reads "
-          "when SquiggleSeek is forward-only; ignored, not counted as FP.)")
-    print("(If any value is n/a, paste the raw pafstats block above and I'll fix the regex.)")
+    print("(extra = tool mappings outside the truth set; ignored, not counted as FP.)")
+
+    # --- Step 1: work-point matching (PR sweep on the SquiggleSeek PAF) ---
+    if args.sweep and args.sweep in pafs:
+        req = not args.ignore_strand
+        sweep_rows = pr_sweep(args.truth, pafs[args.sweep], require_strand=req)
+        print(f"\n======== {args.sweep} PR sweep (score=cosine) ========")
+        print(f"  {'threshold':>10} {'TP':>7} {'FP':>7} {'FN':>7} {'P':>7} {'R':>7} {'F1':>7}")
+        for t, tp, fp, fn, p, r, f1 in sweep_rows:
+            ts = "-inf" if t == float("-inf") else f"{t:.4f}"
+            print(f"  {ts:>10} {tp:>7} {fp:>7} {fn:>7} {p*100:6.1f} {r*100:6.1f} {f1*100:6.1f}")
+
+        all_row = sweep_rows[0]  # threshold -inf = map all
+        wp_rows = [(f"{args.sweep}@all", all_row[4], all_row[5], all_row[6])]
+        target = dict(rows).get(args.match_to) if args.match_to else None
+        if target and target.get("precision") is not None:
+            tp_p = target["precision"]
+            best = recall_at_precision(sweep_rows, tp_p)
+            if best:
+                wp_rows.append((f"{args.sweep}@P>={tp_p*100:.1f}%",
+                                best[4], best[5], best[6]))
+            else:
+                wp_rows.append((f"{args.sweep}@P>={tp_p*100:.1f}%", None, None, None))
+            wp_rows.append((args.match_to, target["precision"], target["recall"], target["f1"]))
+
+        print(f"\n======== work-point matched table ========")
+        print(f"  {'setting':<26s} {'P':>7} {'R':>7} {'F1':>7}")
+        for name, p, r, f1 in wp_rows:
+            cells = "   n/a    n/a    n/a" if p is None else f"{p*100:6.1f} {r*100:6.1f} {f1*100:6.1f}"
+            print(f"  {name:<26s} {cells}")
+        print("==========================================")
 
     csv_path = Path(args.csv) if args.csv else Path(__file__).resolve().parent / "head2head_pafstats.csv"
     header = ["timestamp", "method", "tp", "fp", "fn", "precision", "recall", "f1",
