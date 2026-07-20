@@ -326,17 +326,25 @@ python evaluate/rawhash_compare.py \
     --paf RawHash2=head2head_out/rawhash2.paf \
     --sweep SquiggleSeek --match_to RawHash2 \
     --scorer builtin
-# then repeat with --scorer pafstats (needs UNCALLED) and --scorer mapeval (needs k8)
+# then repeat with --scorer pafstats --uncalled ./pafstats.py  (no HDF5 build)
+#                 and --scorer mapeval  (needs k8 + paftools.js)
 ```
 
 Install for the real scorers (do on your server; nothing auto-installed here):
 ```bash
-# original UNCALLED pafstats
-pip3 install git+https://github.com/skovaka/UNCALLED.git --user
-pip install file-read-backwards          # known missing dep
-# OR paftools.js mapeval
+# pafstats — do NOT `pip install UNCALLED`: it bundles HDF5 and the build breaks
+# (HDF5 install-examples target). uncalled/pafstats.py is pure python
+# (sys/numpy/re/argparse, no C-extension), so grab just that one file:
+wget https://raw.githubusercontent.com/skovaka/UNCALLED/master/uncalled/pafstats.py
+#   then pass it to --uncalled (rawhash_compare runs it in-process):
+#   --scorer pafstats --uncalled ./pafstats.py
+# OR paftools.js mapeval:
 #   k8 runtime + paftools.js from the minimap2 repo (pass --k8 / --paftools if not on PATH)
 ```
+rawhash_compare pads each tool PAF with `*` unmapped records for any truth read
+the tool didn't emit, so pafstats scores against the full truth denominator (the
+same one builtin uses) — otherwise pafstats would silently ignore reads a tool
+dropped and inflate its recall.
 
 Results to collect: (a) the 3-row work-point table + full PR-curve points;
 (b) the three-scorer consistency comparison (builtin vs pafstats vs mapeval on

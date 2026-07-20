@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import re
 import subprocess
 import sys
@@ -27,11 +28,71 @@ from pathlib import Path
 
 
 def run_pafstats(uncalled_bin, truth_paf, tool_paf):
-    """Run `uncalled pafstats -r truth --annotate tool` and return its stderr text
-    (pafstats prints the summary metrics to stderr; annotated PAF to stdout)."""
-    cmd = [uncalled_bin, "pafstats", "-r", str(truth_paf), "--annotate", str(tool_paf)]
+    """Return UNCALLED pafstats' confusion-matrix text for ``tool_paf`` vs truth.
+
+    Two paths, both produce the identical summary format:
+      * ``uncalled_bin`` ending in ``.py`` -> the pure-python ``uncalled/pafstats.py``
+        run IN-PROCESS. UNCALLED bundles HDF5 and often fails to ``pip install``
+        (its HDF5 install-examples target breaks), but ``pafstats.py`` imports only
+        ``sys/numpy/re/argparse`` — no C-extension — so we run just that one file:
+            wget https://raw.githubusercontent.com/skovaka/UNCALLED/master/uncalled/pafstats.py
+            python evaluate/rawhash_compare.py ... --scorer pafstats --uncalled pafstats.py
+      * otherwise the installed ``uncalled`` binary via ``uncalled pafstats``.
+    """
+    padded = _pad_unmapped(truth_paf, tool_paf)
+    if str(uncalled_bin).endswith(".py"):
+        return _run_pafstats_py(uncalled_bin, truth_paf, padded)
+    cmd = [uncalled_bin, "pafstats", "-r", str(truth_paf), "--annotate", str(padded)]
     proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     return proc.stderr
+
+
+def _pad_unmapped(truth_paf, tool_paf):
+    """pafstats keys on the *infile* read set, so reads a tool never emitted a
+    line for are invisible to it (not counted FN) — different tools drop reads
+    differently, which would bias recall. Fix the denominator at the truth set:
+    write a temp PAF = tool records + an unmapped ``*`` record for every truth
+    read the tool is missing. Then pafstats' FN column matches the truth set,
+    the same denominator the builtin scorer uses. Returns the temp path."""
+    import tempfile
+
+    truth = _read_paf(truth_paf)
+    have = set()
+    lines = []
+    with open(tool_paf) as f:
+        for line in f:
+            c = line.rstrip("\n").split("\t")
+            if c and c[0]:
+                have.add(c[0])
+            lines.append(line.rstrip("\n"))
+    for q, (_tn, ts, te, _st, _s) in truth.items():
+        if q not in have:
+            qlen = max(1, te - ts)
+            lines.append("\t".join(str(x) for x in
+                         (q, qlen, 0, 0, "*", "*", 0, 0, 0, 0, 0, 0)))
+    fd, path = tempfile.mkstemp(suffix=".paf", prefix="padded_")
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    return path
+
+
+def _run_pafstats_py(pafstats_py, truth_paf, tool_paf):
+    """Import the vendored/downloaded pure-python pafstats.py and call run() with
+    a minimal args namespace, capturing the summary it writes to stdout."""
+    import importlib.util
+    import io
+    from contextlib import redirect_stdout
+    from types import SimpleNamespace
+
+    spec = importlib.util.spec_from_file_location("uncalled_pafstats", str(pafstats_py))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ns = SimpleNamespace(infile=str(tool_paf), ref_paf=str(truth_paf),
+                         max_reads=None, annotate=False)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        mod.run(ns)  # annotate=False -> summary goes to stdout
+    return buf.getvalue()
 
 
 # --------------------------------------------------------------------------- #
@@ -193,7 +254,11 @@ def parse_args():
     ap.add_argument("--truth", required=True, help="ground_truth.paf")
     ap.add_argument("--paf", action="append", default=[], metavar="NAME=path.paf",
                     help="tool PAF as NAME=path (repeatable), e.g. SquiggleSeek=ss.paf")
-    ap.add_argument("--uncalled", default="uncalled")
+    ap.add_argument("--uncalled", default="uncalled",
+                    help="the `uncalled` binary, OR a path to the pure-python "
+                         "uncalled/pafstats.py (ending .py) run in-process — no "
+                         "HDF5 build needed. Download: wget https://raw."
+                         "githubusercontent.com/skovaka/UNCALLED/master/uncalled/pafstats.py")
     ap.add_argument("--scorer", default="builtin", choices=["builtin", "pafstats", "mapeval"],
                     help="'builtin' = internal locus scorer; 'pafstats' = uncalled pafstats; "
                          "'mapeval' = paftools.js mapeval.")
