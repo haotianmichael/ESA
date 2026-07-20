@@ -55,6 +55,9 @@ PYTHON="${PYTHON:-python}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 HARD_NEG="${HARD_NEG:-8}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+FORWARD_ONLY="${FORWARD_ONLY:-0}"    # 1 = keep only '+' reads (truth + eval); Gate-2 A
+BOTH_STRANDS="${BOTH_STRANDS:-1}"    # 1 = index revcomp windows too (needed for '-' reads)
+SKIP_RAWHASH="${SKIP_RAWHASH:-0}"    # 1 = SquiggleSeek PR sweep only (fast A/B/C sweeps)
 RAWHASH_PRESET="${RAWHASH_PRESET:-sensitive}"  # check Rawhash2/test/ for the R9 preset
 THREADS="${THREADS:-32}"
 LOAD_ENCODER="${LOAD_ENCODER:-}"     # path to a saved encoder to skip training (optional)
@@ -125,10 +128,11 @@ else
     --refine none
     --n_train "$N_TRAIN" --n_query "$N_QUERY"
     --batch_size "$BATCH_SIZE" --hard_negatives "$HARD_NEG"
+    --forward_only "$FORWARD_ONLY" --both_strands "$BOTH_STRANDS"
     --seed "$SEED"
     --paf_out_dir "$OUT"
   )
-  echo "batch_size=$BATCH_SIZE  hard_negatives=$HARD_NEG  PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF"
+  echo "batch_size=$BATCH_SIZE  hard_negatives=$HARD_NEG  forward_only=$FORWARD_ONLY  both_strands=$BOTH_STRANDS  PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF"
   if [ -n "$LOAD_ENCODER" ] && [ -f "$LOAD_ENCODER" ]; then
     PILOT_ARGS+=( --load_encoder "$LOAD_ENCODER" )
     echo "loading encoder: $LOAD_ENCODER (training skipped)"
@@ -146,7 +150,8 @@ echo "truth reads   : $(wc -l < "$OUT/ground_truth.paf")"
 echo "squiggleseek  : $(wc -l < "$OUT/squiggleseek.paf") mapped"
 
 # -----------------------------------------------------------------------------
-if [ "$HAVE_RAWHASH" -eq 1 ]; then
+MATCH_ARGS=( --sweep SquiggleSeek --match_to RawHash2 )
+if [ "$HAVE_RAWHASH" -eq 1 ] && [ "$SKIP_RAWHASH" != "1" ]; then
   say "3. RawHash2 on the identical reads.blow5 (preset=$RAWHASH_PRESET)"
   echo "rawhash2 pore model: $RAWHASH_PORE"
   "$RAWHASH2" -x "$RAWHASH_PRESET" -p "$RAWHASH_PORE" -t "$THREADS" -d "$OUT/ref.idx" "$OUT/ref.fasta" \
@@ -156,8 +161,13 @@ if [ "$HAVE_RAWHASH" -eq 1 ]; then
   echo "rawhash2 lines: $(wc -l < "$OUT/rawhash2.paf")"
   PAF_ARGS=( --paf "SquiggleSeek=$OUT/squiggleseek.paf" --paf "RawHash2=$OUT/rawhash2.paf" )
 else
-  say "3. RawHash2 SKIPPED (binary missing) — scoring SquiggleSeek only"
+  if [ "$SKIP_RAWHASH" = "1" ]; then
+    say "3. RawHash2 SKIPPED (SKIP_RAWHASH=1) — SquiggleSeek PR sweep only (Gate-2 A/B/C)"
+  else
+    say "3. RawHash2 SKIPPED (binary missing) — scoring SquiggleSeek only"
+  fi
   PAF_ARGS=( --paf "SquiggleSeek=$OUT/squiggleseek.paf" )
+  MATCH_ARGS=( --sweep SquiggleSeek )   # no RawHash target; read recall@P from the sweep table
 fi
 
 # -----------------------------------------------------------------------------
@@ -169,7 +179,7 @@ run_scorer() {  # $1 = tag, rest = extra args
     "$PYTHON" "$REPO/evaluate/rawhash_compare.py" \
       --truth "$OUT/ground_truth.paf" \
       "${PAF_ARGS[@]}" \
-      --sweep SquiggleSeek --match_to RawHash2 \
+      "${MATCH_ARGS[@]}" \
       "$@"
   } 2>&1 | tee -a "$SUMMARY"
 }

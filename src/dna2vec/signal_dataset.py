@@ -18,11 +18,19 @@ signals are zero-padded and the mask marks the valid region.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 from torch.utils.data import IterableDataset
+
+
+_COMP = str.maketrans("ACGTNacgtn", "TGCANtgcan")
+
+
+def revcomp(s: str) -> str:
+    """Reverse complement (same convention as upsert_signal.revcomp)."""
+    return s.translate(_COMP)[::-1]
 
 
 # --------------------------------------------------------------------------- #
@@ -83,11 +91,24 @@ class SignalPairDataset(IterableDataset):
         hard_negatives: int = 0,
         hard_neg_min_bp: int = 30,
         hard_neg_max_bp: int = 300,
+        query_strands: Optional[List[str]] = None,
+        query_ends: Optional[List[int]] = None,
     ):
         super().__init__()
         assert len(query_signals) == len(query_coords)
         self.query_signals = query_signals
         self.query_coords = query_coords
+        # Strand-aware positive pairs. A '-' read's recorded signal is the
+        # revcomp of the reference substring, and (because the query is truncated
+        # to input_signal_len ~ win_bp) its 5' end anchors at ``end - win_bp``,
+        # NOT at ``start``. Without this, ~half the pairs (all reverse reads) get
+        # a positive that is a DIFFERENT stretch of DNA — corrupting training.
+        self.query_strands = query_strands
+        self.query_ends = query_ends
+        if query_strands is not None:
+            assert len(query_strands) == len(query_signals)
+        if query_ends is not None:
+            assert len(query_ends) == len(query_signals)
         self.reference_seq = reference_seq
         self.pore_model = pore_model
         self.input_signal_len = input_signal_len
@@ -103,20 +124,36 @@ class SignalPairDataset(IterableDataset):
         self.hard_neg_min_bp = hard_neg_min_bp
         self.hard_neg_max_bp = hard_neg_max_bp
 
-    def _ref_window(self, coord: int):
-        """Expected-signal window (z-normed, fixed length) at a genomic coord."""
+    def _ref_window(self, coord: int, strand: str = "+"):
+        """Expected-signal window (z-normed, fixed length) at a genomic coord.
+
+        ``strand='-'`` reverse-complements the reference bases first, matching
+        the revcomp windows the FAISS index stores and the physical DNA a
+        reverse-strand read traverses.
+        """
         coord = int(min(max(coord, 0), self.max_start))
         ref_bases = self.reference_seq[coord : coord + self.win_bp]
+        if strand == "-":
+            ref_bases = revcomp(ref_bases)
         ref_signal = self.pore_model.sequence_to_signal(ref_bases)
         return preprocess_window(ref_signal, self.input_signal_len, self.downsample_factor)
 
+    def _anchor(self, idx: int) -> Tuple[int, str]:
+        """Genomic anchor + strand of the query's 5' end (what the truncated
+        query signal actually starts at)."""
+        strand = self.query_strands[idx] if self.query_strands is not None else "+"
+        end = self.query_ends[idx] if self.query_ends is not None else None
+        if strand == "-" and end is not None:
+            return max(0, int(end) - self.win_bp), strand   # reverse read's 5' end
+        return int(self.query_coords[idx]), strand
+
     def _pair(self, idx: int):
-        coord = int(self.query_coords[idx])
+        anchor, strand = self._anchor(idx)
 
         q_sig, q_mask = preprocess_window(
             self.query_signals[idx], self.input_signal_len, self.downsample_factor
         )
-        r_sig, r_mask = self._ref_window(coord)
+        r_sig, r_mask = self._ref_window(anchor, strand)
 
         x_1 = {"signal": q_sig, "attention_mask": q_mask}
         x_2 = {"signal": r_sig, "attention_mask": r_mask}
@@ -124,14 +161,15 @@ class SignalPairDataset(IterableDataset):
         if self.hard_negatives <= 0:
             return x_1, x_2
 
-        # Near-coordinate hard negatives: same span, offset by [min,max] bp on a
-        # random side. These force fine positional discrimination that in-batch
-        # random negatives (almost always far away) never exercise.
+        # Near-coordinate hard negatives: same strand & span, offset by [min,max]
+        # bp on a random side. These force fine positional discrimination that
+        # in-batch random negatives (almost always far away) never exercise. The
+        # strand MUST match the anchor, else they collapse into trivial negatives.
         neg_sigs, neg_masks = [], []
         for _ in range(self.hard_negatives):
             sign = 1 if np.random.rand() < 0.5 else -1
             offset = np.random.randint(self.hard_neg_min_bp, self.hard_neg_max_bp + 1)
-            ns, nm = self._ref_window(coord + sign * offset)
+            ns, nm = self._ref_window(anchor + sign * offset, strand)
             neg_sigs.append(ns)
             neg_masks.append(nm)
         x_neg = {

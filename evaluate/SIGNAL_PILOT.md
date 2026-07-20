@@ -350,3 +350,35 @@ Results to collect: (a) the 3-row work-point table + full PR-curve points;
 (b) the three-scorer consistency comparison (builtin vs pafstats vs mapeval on
 the same PAFs); (c) the full both-strand head-to-head table plus forward-only and
 reverse-only recall broken out.
+
+### Step 2c fix-2 — training-side reverse-strand positive-pair bug
+
+A later run exposed a real training bug (not a method ceiling): `SignalPairDataset`
+built every positive pair from the *forward* window `reference[start:start+win]`,
+regardless of strand. A '-' read's recorded signal is `revcomp(reference[start:end])`
+and (because the query is truncated to `input_signal_len` ~ one window) its 5' end
+anchors at `end - win_bp`, not `start`. So ~half the pairs (all reverse reads) had a
+positive that was a *different stretch of DNA* — which degraded precision, flattened
+the confidence score, and made "bigger batch = worse" (more corrupted pairs per
+batch). The index side (`upsert_signal.revcomp`) was already correct; only training
+was wrong. Fixed in `signal_dataset.py`:
+
+- `_ref_window(coord, strand)` now revcomps the bases when `strand=='-'`.
+- `_anchor(idx)` returns `(end - win_bp, '-')` for reverse reads, `(start, '+')` else.
+- hard negatives use the same strand as the anchor.
+- `pilot_recall.py` passes `query_strands` / `query_ends` into the dataset.
+
+Gate 1 (no training): a '-' read's query correlates ~0.93 with the new strand-aware
+window vs ~0.02 with the old forward one (forward path unchanged at ~0.93).
+
+Gate 2 (controlled, via `run_head2head.sh` env knobs — retrain, don't reuse the old
+dirty checkpoint; use a fresh OUT dir per run):
+
+| run | env | expectation |
+|-----|-----|-------------|
+| A | `FORWARD_ONLY=1 BOTH_STRANDS=0 BATCH_SIZE=16 OUT=.../h2h_A` | ~historical forward-only (no regression) |
+| B | `FORWARD_ONLY=0 BOTH_STRANDS=1 BATCH_SIZE=16 OUT=.../h2h_B` | clearly above the old 96.1% |
+| C | `FORWARD_ONLY=0 BOTH_STRANDS=1 BATCH_SIZE=48 OUT=.../h2h_C` | **>= B** (the batch pathology is gone) |
+
+`SKIP_RAWHASH=1` runs only the SquiggleSeek PR sweep (fast) for A/B/C; read recall at
+P>=99.9% straight off the sweep table. Then one full run (RawHash on) on the winner.

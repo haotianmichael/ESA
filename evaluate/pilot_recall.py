@@ -779,6 +779,8 @@ def main():
         dataset = SignalPairDataset(
             query_signals=[r.signal for r in train_reads],
             query_coords=[r.reference_start for r in train_reads],
+            query_strands=[r.strand for r in train_reads],
+            query_ends=[r.reference_end for r in train_reads],
             reference_seq=reference_seq, pore_model=pore_model,
             unit_length=args.unit_length,
             input_signal_len=args.input_signal_len, downsample_factor=args.downsample_factor,
