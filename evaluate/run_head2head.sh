@@ -19,16 +19,26 @@
 set -u
 set -o pipefail
 
-# ---- config: edit to match your server (or override via env) ----------------
-REPO="${REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
+# ---- config: paths are wired for this server; override any via env ----------
+# Layout on this box:  /home/nfs/mahaotian/ESA/{squigulator,Rawhash2,UNCALLED,...}
+BASE="${BASE:-/home/nfs/mahaotian/ESA}"
+export PATH="$PATH:$BASE/squigulator"                       # squigulator on PATH
+export PORE_MODEL_PATH="${PORE_MODEL_PATH:-$BASE/squigulator/r9_6mer_pore_model.txt}"
+# rawhash2: use $RAWHASH2 if set, else PATH, else auto-find under Rawhash2/
+if [ -z "${RAWHASH2:-}" ]; then
+  RAWHASH2="$(command -v rawhash2 2>/dev/null || \
+              find "$BASE/Rawhash2" -maxdepth 4 -type f -name rawhash2 2>/dev/null | head -1)"
+  RAWHASH2="${RAWHASH2:-rawhash2}"
+fi
+
+REPO="${REPO:-$(cd "$(dirname "$0")/.." && pwd)}"           # repo root (auto)
 OUT="${OUT:-$REPO/head2head_out}"
 REF_BP="${REF_BP:-1000000}"          # reference length (bp); random, seed-fixed
 N_TRAIN="${N_TRAIN:-20000}"          # training reads
 N_QUERY="${N_QUERY:-5000}"           # eval/query reads (the head-to-head set)
 SEED="${SEED:-42}"
 PYTHON="${PYTHON:-python}"
-RAWHASH2="${RAWHASH2:-rawhash2}"     # rawhash2 binary (name on PATH or full path)
-RAWHASH_PRESET="${RAWHASH_PRESET:-sensitive}"  # check RawHash/test/ for the R9 preset
+RAWHASH_PRESET="${RAWHASH_PRESET:-sensitive}"  # check Rawhash2/test/ for the R9 preset
 THREADS="${THREADS:-32}"
 LOAD_ENCODER="${LOAD_ENCODER:-}"     # path to a saved encoder to skip training (optional)
 SAVE_ENCODER="${SAVE_ENCODER:-$OUT/encoder.pt}"
