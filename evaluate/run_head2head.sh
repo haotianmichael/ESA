@@ -38,6 +38,12 @@ N_TRAIN="${N_TRAIN:-20000}"          # training reads
 N_QUERY="${N_QUERY:-5000}"           # eval/query reads (the head-to-head set)
 SEED="${SEED:-42}"
 PYTHON="${PYTHON:-python}"
+# GPU memory: the hard-neg encode pushes B*H length-2000 signals through Mamba2
+# in one backward. B=64,H=8 -> 512 seqs OOMs a 32GB V100 (Triton autotuner spike).
+# B=16,H=8 -> 128 seqs fits. Drop BATCH_SIZE further (8) if it still OOMs.
+BATCH_SIZE="${BATCH_SIZE:-16}"
+HARD_NEG="${HARD_NEG:-8}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 RAWHASH_PRESET="${RAWHASH_PRESET:-sensitive}"  # check Rawhash2/test/ for the R9 preset
 THREADS="${THREADS:-32}"
 LOAD_ENCODER="${LOAD_ENCODER:-}"     # path to a saved encoder to skip training (optional)
@@ -102,9 +108,11 @@ PILOT_ARGS=(
   --ref_bp 0
   --refine none
   --n_train "$N_TRAIN" --n_query "$N_QUERY"
+  --batch_size "$BATCH_SIZE" --hard_negatives "$HARD_NEG"
   --seed "$SEED"
   --paf_out_dir "$OUT"
 )
+echo "batch_size=$BATCH_SIZE  hard_negatives=$HARD_NEG  PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF"
 if [ -n "$LOAD_ENCODER" ] && [ -f "$LOAD_ENCODER" ]; then
   PILOT_ARGS+=( --load_encoder "$LOAD_ENCODER" )
   echo "loading encoder: $LOAD_ENCODER (training skipped)"
