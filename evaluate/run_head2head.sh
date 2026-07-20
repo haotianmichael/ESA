@@ -31,9 +31,14 @@ if [ -z "${RAWHASH2:-}" ]; then
   RAWHASH2="${RAWHASH2:-rawhash2}"
 fi
 # RawHash2 needs a pore model to build its index from a FASTA. Prefer its own
-# official R9 model (don't tune the opponent's config); fall back to ours.
+# official R9.4 450bps 6-mer model (matches squigulator dna-r9-min); avoid the
+# r9.2 / RNA variants that also ship as template_median68pA.model. Don't tune the
+# opponent's config; fall back to ours only if nothing is found.
 if [ -z "${RAWHASH_PORE:-}" ]; then
-  RAWHASH_PORE="$(find "$BASE/Rawhash2" -maxdepth 6 -type f -name 'template_median68pA.model' 2>/dev/null | head -1)"
+  _cands="$(find "$BASE/Rawhash2" -maxdepth 6 -type f -name 'template_median68pA.model' 2>/dev/null)"
+  RAWHASH_PORE="$(echo "$_cands" | grep -i 'r9.4_180mv_450bps_6mer' | head -1)"
+  [ -z "$RAWHASH_PORE" ] && RAWHASH_PORE="$(echo "$_cands" | grep -iv 'rna' | grep -i 'r9.4' | head -1)"
+  [ -z "$RAWHASH_PORE" ] && RAWHASH_PORE="$(echo "$_cands" | head -1)"
   RAWHASH_PORE="${RAWHASH_PORE:-$PORE_MODEL_PATH}"
 fi
 
