@@ -58,6 +58,8 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 FORWARD_ONLY="${FORWARD_ONLY:-0}"    # 1 = keep only '+' reads (truth + eval); Gate-2 A
 BOTH_STRANDS="${BOTH_STRANDS:-1}"    # 1 = index revcomp windows too (needed for '-' reads)
 SKIP_RAWHASH="${SKIP_RAWHASH:-0}"    # 1 = SquiggleSeek PR sweep only (fast A/B/C sweeps)
+AMP_NOISE="${AMP_NOISE:-}"           # squigulator --amp-noise (blank = its default); noise sweep
+DWELL_STD="${DWELL_STD:-}"           # squigulator --dwell-std  (blank = its default, ~4); noise sweep
 RAWHASH_PRESET="${RAWHASH_PRESET:-sensitive}"  # check Rawhash2/test/ for the R9 preset
 THREADS="${THREADS:-32}"
 LOAD_ENCODER="${LOAD_ENCODER:-}"     # path to a saved encoder to skip training (optional)
@@ -132,6 +134,8 @@ else
     --seed "$SEED"
     --paf_out_dir "$OUT"
   )
+  [ -n "$AMP_NOISE" ] && PILOT_ARGS+=( --amp_noise "$AMP_NOISE" )
+  [ -n "$DWELL_STD" ] && PILOT_ARGS+=( --dwell_std "$DWELL_STD" )
   echo "batch_size=$BATCH_SIZE  hard_negatives=$HARD_NEG  forward_only=$FORWARD_ONLY  both_strands=$BOTH_STRANDS  PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF"
   if [ -n "$LOAD_ENCODER" ] && [ -f "$LOAD_ENCODER" ]; then
     PILOT_ARGS+=( --load_encoder "$LOAD_ENCODER" )

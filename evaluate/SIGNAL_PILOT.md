@@ -382,3 +382,23 @@ dirty checkpoint; use a fresh OUT dir per run):
 
 `SKIP_RAWHASH=1` runs only the SquiggleSeek PR sweep (fast) for A/B/C; read recall at
 P>=99.9% straight off the sweep table. Then one full run (RawHash on) on the winner.
+
+### Stage 3 — formal same-batch head-to-head + noise sweep (paper figure E1)
+
+Uses the Gate-2 C checkpoint via `--load_encoder` (no retraining — the honest
+setting; RawHash isn't noise-tuned either).
+
+PART 1 (formal head-to-head): one `run_head2head.sh` run with `LOAD_ENCODER` set,
+`SKIP_RAWHASH=0`, default noise. Both tools run on the identical blow5 / same
+ground truth; prints the two-work-point table (`@all`, `@P>=RawHash precision`) for
+SquiggleSeek plus RawHash's single row, under builtin AND real pafstats.
+
+PART 2 (noise sweep): `run_noise_sweep.sh` fixes the C checkpoint and sweeps
+squigulator noise (`AMP_LIST` default `default 1.5 2.0 3.0 5.0` at `DWELL_LIST=4`;
+widen to `"4 8 12"` later). Each point regenerates reads with the SAME seed, so the
+true coordinate set is identical across noise levels (paired comparison) — verified
+by the `[gate1]` coord print. Per point it runs the full head-to-head and
+`noise_point_eval.py` appends SquiggleSeek@all, SquiggleSeek@P>=99.9%, RawHash2@all
+to `noise_sweep.csv` and prints a `[trend]` line. Read: RawHash F1 should fall
+faster than SquiggleSeek as amp rises (that IS the paper's claim); report honestly
+if it doesn't.
