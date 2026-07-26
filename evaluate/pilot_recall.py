@@ -141,6 +141,10 @@ def parse_args():
     p.add_argument("--temperature", type=float, default=0.05)
 
     p.add_argument("--tol_bp", type=int, default=15)
+    p.add_argument("--fast_sweep", type=int, default=0,
+                   help="Skip the random + untrained baseline index builds/eval (noise-sweep "
+                        "speedup). Only the trained store is built; retrieval-top1 recall + PAF "
+                        "export are unchanged. Use with --load_encoder.")
     p.add_argument("--probe", type=int, default=1,
                    help="1 = print a one-batch collapse probe (input/embedding across-batch std) "
                         "before training, to localize a stuck ln(N) loss.")
@@ -758,18 +762,20 @@ def main():
     print(f"[info] distinct eval coords = {n_distinct} / {len(eval_reads)} "
           f"(should be ~= n_query; ==1 means the coordinate bug is back)")
 
-    # --- random baseline ---
-    rec_random, mrr_random = evaluate_random(
-        len(reference_seq), eval_reads, args.unit_length, stride,
-        topk_list, args.tol_bp, args.seed,
-    )
-
-    # --- untrained encoder ---
-    untrained_model, _ = make_signal_model(args, device)
-    store_u = build_store(untrained_model, "signal-pilot-untrained", device,
-                          reference_seq, pore_model, args)
-    rec_untrained, mrr_untrained = evaluate_recall(
-        store_u, eval_reads, topk_list, args.tol_bp, args.unit_length)
+    # --- random + untrained baselines (skipped in --fast_sweep to save one full
+    #     index build per noise point; they don't affect the head-to-head) ---
+    if args.fast_sweep:
+        rec_random = mrr_random = rec_untrained = mrr_untrained = None
+    else:
+        rec_random, mrr_random = evaluate_random(
+            len(reference_seq), eval_reads, args.unit_length, stride,
+            topk_list, args.tol_bp, args.seed,
+        )
+        untrained_model, _ = make_signal_model(args, device)
+        store_u = build_store(untrained_model, "signal-pilot-untrained", device,
+                              reference_seq, pore_model, args)
+        rec_untrained, mrr_untrained = evaluate_recall(
+            store_u, eval_reads, topk_list, args.tol_bp, args.unit_length)
 
     # --- trained (or loaded) encoder ---
     if args.load_encoder and os.path.exists(args.load_encoder):
@@ -805,20 +811,21 @@ def main():
 
     # --- report ---
     print("\n================ recall (tol +/-%dbp, coverage) ================" % args.tol_bp)
-    print_table("random", rec_random, mrr_random, topk_list)
-    print_table("untrained", rec_untrained, mrr_untrained, topk_list)
+    if not args.fast_sweep:
+        print_table("random", rec_random, mrr_random, topk_list)
+        print_table("untrained", rec_untrained, mrr_untrained, topk_list)
     print_table("trained", rec_trained, mrr_trained, topk_list)
     print("================================================================")
-    verdict = (rec_trained[10] > rec_untrained[10] > rec_random[10])
-    print(f"[go/no-go] trained > untrained > random @10: "
-          f"{'GO' if verdict else 'NO-GO (investigate)'}")
-
-    csv_path = args.results_csv or (Path(__file__).resolve().parent / "signal_pilot_results.csv")
-    append_results_csv(csv_path, args, topk_list, [
-        ("random", rec_random, mrr_random),
-        ("untrained", rec_untrained, mrr_untrained),
-        ("trained", rec_trained, mrr_trained),
-    ])
+    if not args.fast_sweep:
+        verdict = (rec_trained[10] > rec_untrained[10] > rec_random[10])
+        print(f"[go/no-go] trained > untrained > random @10: "
+              f"{'GO' if verdict else 'NO-GO (investigate)'}")
+        csv_path = args.results_csv or (Path(__file__).resolve().parent / "signal_pilot_results.csv")
+        append_results_csv(csv_path, args, topk_list, [
+            ("random", rec_random, mrr_random),
+            ("untrained", rec_untrained, mrr_untrained),
+            ("trained", rec_trained, mrr_trained),
+        ])
 
     # --- Step 2a: three arms, each under its own criterion ---
     res = evaluate_arms(store_t, eval_reads, reference_seq, pore_model, args)

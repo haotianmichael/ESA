@@ -44,7 +44,10 @@ fi
 
 REPO="${REPO:-$(cd "$(dirname "$0")/.." && pwd)}"           # repo root (auto)
 OUT="${OUT:-$REPO/head2head_out}"
-REF_BP="${REF_BP:-1000000}"          # reference length (bp); random, seed-fixed
+REF_FASTA="${REF_FASTA:-}"           # real genome FASTA (single record). If set, used
+                                     # verbatim (skip random gen) — e.g. full 4.64Mb E. coli.
+REF_BP="${REF_BP:-1000000}"          # random reference length (bp) when REF_FASTA unset
+FAST_SWEEP="${FAST_SWEEP:-0}"        # 1 = skip random/untrained baselines (noise-sweep speedup)
 N_TRAIN="${N_TRAIN:-20000}"          # training reads
 N_QUERY="${N_QUERY:-5000}"           # eval/query reads (the head-to-head set)
 SEED="${SEED:-42}"
@@ -89,10 +92,15 @@ echo "pore model : $PORE_MODEL_PATH"
 echo "rawhash2   : $(command -v "$RAWHASH2" 2>/dev/null || echo MISSING)"
 
 # -----------------------------------------------------------------------------
-say "1. reference + pafstats.py (from scratch)"
-REF_FA="$OUT/ref.fa"
-if [ ! -s "$REF_FA" ]; then
-  "$PYTHON" - "$REF_BP" "$SEED" "$REF_FA" <<'PY'
+say "1. reference + pafstats.py"
+if [ -n "$REF_FASTA" ]; then
+  [ -s "$REF_FASTA" ] || fail "REF_FASTA not found: $REF_FASTA"
+  REF_FA="$REF_FASTA"                        # real genome, used verbatim
+  echo "using real reference: $REF_FA ($(grep -vc '^>' "$REF_FA" | tr -d ' ') seq lines)"
+else
+  REF_FA="$OUT/ref.fa"
+  if [ ! -s "$REF_FA" ]; then
+    "$PYTHON" - "$REF_BP" "$SEED" "$REF_FA" <<'PY'
 import sys, random
 n, seed, path = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
 random.seed(seed)
@@ -103,8 +111,9 @@ with open(path, 'w') as f:
         f.write(seq[i:i+80] + '\n')
 print(f"wrote {path}: {len(seq)} bp")
 PY
-else
-  echo "reuse existing $REF_FA"
+  else
+    echo "reuse existing $REF_FA"
+  fi
 fi
 
 PAFSTATS_PY="$OUT/pafstats.py"
@@ -131,6 +140,7 @@ else
     --n_train "$N_TRAIN" --n_query "$N_QUERY"
     --batch_size "$BATCH_SIZE" --hard_negatives "$HARD_NEG"
     --forward_only "$FORWARD_ONLY" --both_strands "$BOTH_STRANDS"
+    --fast_sweep "$FAST_SWEEP"
     --seed "$SEED"
     --paf_out_dir "$OUT"
   )

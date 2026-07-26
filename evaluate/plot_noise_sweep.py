@@ -1,46 +1,49 @@
-"""Plot the noise-sweep figure (paper figure E1) from noise_sweep.csv.
+"""Plot a noise-sweep figure from noise_sweep.csv.
 
-F1 vs amplitude noise, one line per method (SquiggleSeek@all, RawHash2@all), for a
-chosen dwell_std row. Run on the server where matplotlib is installed:
+Two figures for the paper (choose the axis with --vary):
+  E1:  F1 vs amplitude noise at a fixed dwell_std   (--vary amp   --dwell 4)
+  E1b: F1 vs dwell_std at a fixed amp_noise          (--vary dwell --amp default)
+One line per method (SquiggleSeek@all, RawHash2@all). Run on the server where
+matplotlib is installed:
 
-    python evaluate/plot_noise_sweep.py --csv evaluate/noise_sweep.csv --dwell 4 \
-        --out evaluate/noise_sweep_E1.png
+    python evaluate/plot_noise_sweep.py --csv evaluate/noise_sweep.csv \
+        --vary amp --dwell 4 --out evaluate/noise_sweep_E1.png
 """
 from __future__ import annotations
 
 import argparse
 import csv
-from collections import defaultdict
 
 
-def load(csv_path, dwell):
-    # (method, work_point, amp) -> f1 ; keep the last timestamp for each key
+def load(csv_path, vary, fixed_col, fixed_val):
+    # (method, work_point, x) -> f1 ; keep the last row for each key
     f1 = {}
-    rec = {}
-    amps = []
+    xs = []
     with open(csv_path) as f:
         for r in csv.DictReader(f):
-            if str(r["dwell_std"]) != str(dwell):
+            if str(r[fixed_col]) != str(fixed_val):
                 continue
-            key = (r["method"], r["work_point"], r["amp_noise"])
+            x = r[vary]
+            key = (r["method"], r["work_point"], x)
             f1[key] = float(r["f1"]) if r["f1"] not in ("", "None") else None
-            rec.setdefault(r["method"], {})
-            if r["amp_noise"] not in amps:
-                amps.append(r["amp_noise"])
-    return f1, amps
+            if x not in xs:
+                xs.append(x)
+    return f1, xs
 
 
-def amp_order(amps):
+def order(vals):
     # 'default' first, then numeric ascending
     def k(a):
         return (0, 0.0) if a == "default" else (1, float(a))
-    return sorted(set(amps), key=k)
+    return sorted(set(vals), key=k)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True)
-    ap.add_argument("--dwell", default="4")
+    ap.add_argument("--vary", choices=["amp", "dwell"], default="amp")
+    ap.add_argument("--dwell", default="4", help="fixed dwell_std when --vary amp")
+    ap.add_argument("--amp", default="default", help="fixed amp_noise when --vary dwell")
     ap.add_argument("--out", default="evaluate/noise_sweep_E1.png")
     a = ap.parse_args()
 
@@ -48,8 +51,15 @@ def main():
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    f1, amps = load(a.csv, a.dwell)
-    xs = amp_order(amps)
+    if a.vary == "amp":
+        vary_col, fixed_col, fixed_val, xlabel = "amp_noise", "dwell_std", a.dwell, "amplitude noise"
+        fixed_desc = f"dwell_std={a.dwell}"
+    else:
+        vary_col, fixed_col, fixed_val, xlabel = "dwell_std", "amp_noise", a.amp, "dwell_std"
+        fixed_desc = f"amp_noise={a.amp}"
+
+    f1, raw = load(a.csv, vary_col, fixed_col, fixed_val)
+    xs = order(raw)
     xi = list(range(len(xs)))
     ss = [f1.get(("SquiggleSeek", "@all", a_)) for a_ in xs]
     rh = [f1.get(("RawHash2", "@all", a_)) for a_ in xs]
@@ -60,12 +70,15 @@ def main():
     ax.plot(xi, ss, "-o", color="#2563eb", lw=2.2, ms=6, label="SquiggleSeek (learned)")
     ax.plot(xi, rh, "-s", color="#dc2626", lw=2.2, ms=6, label="RawHash2 (hash)")
     ax.set_xticks(xi)
-    ax.set_xticklabels([("default" if x == "default" else f"{float(x):g}×") for x in xs])
-    ax.set_xlabel("squigulator amplitude noise")
+    if a.vary == "amp":
+        ax.set_xticklabels([("default" if x == "default" else f"{float(x):g}×") for x in xs])
+    else:
+        ax.set_xticklabels([str(x) for x in xs])
+    ax.set_xlabel(f"squigulator {xlabel}")
     ax.set_ylabel("mapping F1 (%)  @all")
     ax.set_ylim(-3, 103)
     ax.grid(True, alpha=0.3)
-    ax.set_title(f"Noise robustness (dwell_std={a.dwell}, 1 Mb ref, 5000 reads)")
+    ax.set_title(f"Noise robustness ({fixed_desc}, 5000 reads)")
     ax.legend(frameon=False)
     for x, y in zip(xi, ss):
         if y is not None:

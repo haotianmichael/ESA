@@ -26,7 +26,8 @@ SWEEP_OUT="${SWEEP_OUT:-$BASE/CALL_ESA/noise_sweep}"
 CSV="${CSV:-$REPO/evaluate/noise_sweep.csv}"
 PYTHON="${PYTHON:-python}"
 AMP_LIST="${AMP_LIST:-default 1.5 2.0 3.0 5.0}"   # squigulator --amp-noise
-DWELL_LIST="${DWELL_LIST:-4}"                     # 4 = squigulator default; add 8 12 later
+DWELL_LIST="${DWELL_LIST:-4}"                     # 4 = squigulator default; "4 8 12" = full 2D grid
+REF_FASTA="${REF_FASTA:-}"          # real genome (e.g. full E. coli); empty = random ref of REF_BP
 REF_BP="${REF_BP:-1000000}"
 N_QUERY="${N_QUERY:-5000}"
 N_TRAIN="${N_TRAIN:-200}"          # tiny: we load a checkpoint, no training happens
@@ -53,8 +54,8 @@ for dwell in $DWELL_LIST; do
     # full head-to-head at this noise point: C checkpoint (no retrain), RawHash on,
     # SAME seed/ref. RawHash's command line + preset + pore model are unchanged.
     LOAD_ENCODER="$CHECKPOINT" \
-    FORWARD_ONLY=0 BOTH_STRANDS=1 SKIP_RAWHASH=0 \
-    REF_BP="$REF_BP" N_QUERY="$N_QUERY" N_TRAIN="$N_TRAIN" SEED="$SEED" \
+    FORWARD_ONLY=0 BOTH_STRANDS=1 SKIP_RAWHASH=0 FAST_SWEEP=1 \
+    REF_FASTA="$REF_FASTA" REF_BP="$REF_BP" N_QUERY="$N_QUERY" N_TRAIN="$N_TRAIN" SEED="$SEED" \
     AMP_NOISE="$env_amp" DWELL_STD="$env_dwell" \
     OUT="$pdir" \
       bash "$HERE/run_head2head.sh" || { echo "!! point $tag failed, skipping"; continue; }
