@@ -54,7 +54,7 @@ for dwell in $DWELL_LIST; do
     # full head-to-head at this noise point: C checkpoint (no retrain), RawHash on,
     # SAME seed/ref. RawHash's command line + preset + pore model are unchanged.
     LOAD_ENCODER="$CHECKPOINT" \
-    FORWARD_ONLY=0 BOTH_STRANDS=1 SKIP_RAWHASH=0 FAST_SWEEP=1 \
+    FORWARD_ONLY=0 BOTH_STRANDS=1 SKIP_RAWHASH=0 FAST_SWEEP=1 FAISS_CPU="${FAISS_CPU:-1}" \
     REF_FASTA="$REF_FASTA" REF_BP="$REF_BP" N_QUERY="$N_QUERY" N_TRAIN="$N_TRAIN" SEED="$SEED" \
     AMP_NOISE="$env_amp" DWELL_STD="$env_dwell" \
     OUT="$pdir" \

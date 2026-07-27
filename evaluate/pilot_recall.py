@@ -141,6 +141,9 @@ def parse_args():
     p.add_argument("--temperature", type=float, default=0.05)
 
     p.add_argument("--tol_bp", type=int, default=15)
+    p.add_argument("--faiss_cpu", type=int, default=0,
+                   help="Keep the FAISS index on CPU (encoder still runs on GPU). Avoids GPU-OOM "
+                        "when building a large index (e.g. full E. coli both strands ~618k vectors).")
     p.add_argument("--fast_sweep", type=int, default=0,
                    help="Skip the random + untrained baseline index builds/eval (noise-sweep "
                         "speedup). Only the trained store is built; retrieval-top1 recall + PAF "
@@ -203,9 +206,17 @@ def resolve_index_stride(args):
 
 def build_store(signal_model, name, device, reference_seq, pore_model, args):
     stride = resolve_index_stride(args)
-    store = SignalFaissStore(signal_model=signal_model, index_name=name, device=device)
+    # The encoder stays on `device` (GPU); the FAISS index can live on CPU to avoid
+    # GPU-OOM on large genomes. FAISS uses its own cudaMalloc, which contends with
+    # PyTorch's caching allocator — a full E. coli both-strand index (~618k vectors)
+    # can fail the GPU alloc. --faiss_cpu keeps the index in RAM (flat search stays
+    # fast); empty_cache() first releases PyTorch's reserve for the GPU path.
+    store_device = "cpu" if getattr(args, "faiss_cpu", 0) else device
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    store = SignalFaissStore(signal_model=signal_model, index_name=name, device=store_device)
     store.drop_table()  # start clean for a reproducible pilot
-    store = SignalFaissStore(signal_model=signal_model, index_name=name, device=device)
+    store = SignalFaissStore(signal_model=signal_model, index_name=name, device=store_device)
     build_signal_reference_index(
         reference_seq=reference_seq, pore_model=pore_model, signal_model=signal_model,
         store=store, unit_length=args.unit_length, stride=stride,

@@ -48,6 +48,7 @@ REF_FASTA="${REF_FASTA:-}"           # real genome FASTA (single record). If set
                                      # verbatim (skip random gen) — e.g. full 4.64Mb E. coli.
 REF_BP="${REF_BP:-1000000}"          # random reference length (bp) when REF_FASTA unset
 FAST_SWEEP="${FAST_SWEEP:-0}"        # 1 = skip random/untrained baselines (noise-sweep speedup)
+FAISS_CPU="${FAISS_CPU:-0}"          # 1 = FAISS index on CPU (avoids GPU-OOM on full-genome index)
 N_TRAIN="${N_TRAIN:-20000}"          # training reads
 N_QUERY="${N_QUERY:-5000}"           # eval/query reads (the head-to-head set)
 SEED="${SEED:-42}"
@@ -140,7 +141,7 @@ else
     --n_train "$N_TRAIN" --n_query "$N_QUERY"
     --batch_size "$BATCH_SIZE" --hard_negatives "$HARD_NEG"
     --forward_only "$FORWARD_ONLY" --both_strands "$BOTH_STRANDS"
-    --fast_sweep "$FAST_SWEEP"
+    --fast_sweep "$FAST_SWEEP" --faiss_cpu "$FAISS_CPU"
     --seed "$SEED"
     --paf_out_dir "$OUT"
   )
