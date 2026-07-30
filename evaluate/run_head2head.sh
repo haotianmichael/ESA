@@ -50,6 +50,7 @@ REF_BP="${REF_BP:-1000000}"          # random reference length (bp) when REF_FAS
 FAST_SWEEP="${FAST_SWEEP:-0}"        # 1 = skip random/untrained baselines (noise-sweep speedup)
 FAISS_CPU="${FAISS_CPU:-0}"          # 1 = FAISS index on CPU (avoids GPU-OOM on full-genome index)
 N_TRAIN="${N_TRAIN:-20000}"          # training reads
+TRAIN_STEPS="${TRAIN_STEPS:-2000}"   # optimizer steps (2000 = original behavior)
 N_QUERY="${N_QUERY:-5000}"           # eval/query reads (the head-to-head set)
 SEED="${SEED:-42}"
 PYTHON="${PYTHON:-python}"
@@ -138,7 +139,7 @@ else
     --pore_model "$PORE_MODEL_PATH"
     --ref_bp 0
     --refine none
-    --n_train "$N_TRAIN" --n_query "$N_QUERY"
+    --n_train "$N_TRAIN" --n_query "$N_QUERY" --train_steps "$TRAIN_STEPS"
     --batch_size "$BATCH_SIZE" --hard_negatives "$HARD_NEG"
     --forward_only "$FORWARD_ONLY" --both_strands "$BOTH_STRANDS"
     --fast_sweep "$FAST_SWEEP" --faiss_cpu "$FAISS_CPU"
