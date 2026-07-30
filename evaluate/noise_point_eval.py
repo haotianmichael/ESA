@@ -35,31 +35,33 @@ def _diag_criteria(truth_paf, ss_paf, tol_bp=15):
     """
     truth = _read_paf(truth_paf)
     tool = _read_paf(ss_paf)
-    n = ov = strict = 0
+    n = ov = cov = 0
     examples = []
     for q, (tn, tts, tte, tst, _s) in truth.items():
-        if q not in tool:
-            n += 1
-            continue
         n += 1
+        if q not in tool:
+            continue
         _tn2, rts, rte, _st2, _s2 = tool[q]
+        # covers = the pilot's retrieval-top1 criterion _covers(coord, true, unit, tol):
+        #   (rts - tol) <= true_start < (rts + span + tol)   [span = rte - rts]
+        is_cov = (rts - tol_bp) <= tts < (rte + tol_bp)
+        # overlap = the @all / pafstats locus criterion
         is_ov = max(tts, rts) < min(tte, rte)
-        is_strict = abs(rts - tts) <= tol_bp
+        cov += is_cov
         ov += is_ov
-        strict += is_strict
-        if len(examples) < 5:
-            examples.append((q, tts, rts, rts - tts, is_strict, is_ov))
+        if len(examples) < 6:
+            examples.append((q, tts, rts, rts - tts, is_cov, is_ov))
     print(f"[diag] {ss_paf}", flush=True)
     print(f"[diag] retrieval accuracy under two criteria on the SAME top-1 coords:", flush=True)
-    print(f"[diag]   strict |start-true|<= {tol_bp}bp : {strict}/{n} = {100*strict/n:.1f}%  "
+    print(f"[diag]   _covers (+/-{tol_bp}bp window)   : {cov}/{n} = {100*cov/n:.1f}%  "
           f"(== the pilot's retrieval-top1)", flush=True)
-    print(f"[diag]   locus overlap (>=1bp)          : {ov}/{n} = {100*ov/n:.1f}%  "
+    print(f"[diag]   locus overlap (>=1bp)      : {ov}/{n} = {100*ov/n:.1f}%  "
           f"(== @all / pafstats)", flush=True)
-    print(f"[diag]   -> the ~30pp gap is the CRITERION, present on the identical coords.", flush=True)
-    print(f"[diag]   examples (read, true_start, reported_start, diff, strict?, overlap?):", flush=True)
-    for q, tt, rt, df, st, ovl in examples:
-        print(f"[diag]     {q[:24]:<24} true={tt:>9} rep={rt:>9} diff={df:>+6} "
-              f"strict={'Y' if st else 'N'} overlap={'Y' if ovl else 'N'}", flush=True)
+    print(f"[diag]   -> the gap is the CRITERION, on the identical coords (not a path bug).", flush=True)
+    print(f"[diag]   examples (read, true_start, reported_start, diff, covers?, overlap?):", flush=True)
+    for q, tt, rt, df, cv, ovl in examples:
+        print(f"[diag]     {q[:26]:<26} true={tt:>9} rep={rt:>9} diff={df:>+7} "
+              f"covers={'Y' if cv else 'N'} overlap={'Y' if ovl else 'N'}", flush=True)
 
 
 def main():
