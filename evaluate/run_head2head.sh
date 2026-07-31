@@ -62,6 +62,8 @@ HARD_NEG="${HARD_NEG:-8}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 FORWARD_ONLY="${FORWARD_ONLY:-0}"    # 1 = keep only '+' reads (truth + eval); Gate-2 A
 BOTH_STRANDS="${BOTH_STRANDS:-1}"    # 1 = index revcomp windows too (needed for '-' reads)
+ENCODER_TYPE="${ENCODER_TYPE:-mamba}"  # mamba | transformer | cnn_rnn (encoder ablation)
+OVERLAP="${OVERLAP:-285}"            # index tiling overlap; stride = unit_length - overlap (tiling ablation)
 SKIP_RAWHASH="${SKIP_RAWHASH:-0}"    # 1 = SquiggleSeek PR sweep only (fast A/B/C sweeps)
 AMP_NOISE="${AMP_NOISE:-}"           # squigulator --amp-noise (blank = its default); noise sweep
 DWELL_STD="${DWELL_STD:-}"           # squigulator --dwell-std  (blank = its default, ~4); noise sweep
@@ -142,13 +144,14 @@ else
     --n_train "$N_TRAIN" --n_query "$N_QUERY" --train_steps "$TRAIN_STEPS"
     --batch_size "$BATCH_SIZE" --hard_negatives "$HARD_NEG"
     --forward_only "$FORWARD_ONLY" --both_strands "$BOTH_STRANDS"
+    --encoder_type "$ENCODER_TYPE" --overlap "$OVERLAP"
     --fast_sweep "$FAST_SWEEP" --faiss_cpu "$FAISS_CPU"
     --seed "$SEED"
     --paf_out_dir "$OUT"
   )
   [ -n "$AMP_NOISE" ] && PILOT_ARGS+=( --amp_noise "$AMP_NOISE" )
   [ -n "$DWELL_STD" ] && PILOT_ARGS+=( --dwell_std "$DWELL_STD" )
-  echo "batch_size=$BATCH_SIZE  hard_negatives=$HARD_NEG  forward_only=$FORWARD_ONLY  both_strands=$BOTH_STRANDS  PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF"
+  echo "batch_size=$BATCH_SIZE  hard_negatives=$HARD_NEG  forward_only=$FORWARD_ONLY  both_strands=$BOTH_STRANDS  encoder_type=$ENCODER_TYPE  overlap=$OVERLAP  PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF"
   if [ -n "$LOAD_ENCODER" ] && [ -f "$LOAD_ENCODER" ]; then
     PILOT_ARGS+=( --load_encoder "$LOAD_ENCODER" )
     echo "loading encoder: $LOAD_ENCODER (training skipped)"
