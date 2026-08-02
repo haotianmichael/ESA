@@ -160,6 +160,30 @@ def builtin_pafstats(truth_paf, tool_paf, require_strand=True):
     return _score_truth_tool(_read_paf(truth_paf), _read_paf(tool_paf), require_strand)
 
 
+def _paf_all_qnames(path):
+    """Every query name (column 0) in a PAF, mapped or unmapped ('*' rows)."""
+    q = set()
+    with open(path) as f:
+        for line in f:
+            c = line.rstrip("\n").split("\t")
+            if c and c[0]:
+                q.add(c[0])
+    return q
+
+
+def qname_overlap(truth_paf, tool_paf):
+    """Fraction of TRUTH read-ids present in ``tool_paf`` (and raw counts).
+
+    pafstats matches reads by qname, so if the tool and truth id formats differ
+    the intersection is empty and recall silently reads 0. Report the ratio so an
+    id mismatch is caught before the P/R/F1 table is trusted (PROMPT §六)."""
+    tq = _paf_all_qnames(truth_paf)
+    pq = _paf_all_qnames(tool_paf)
+    inter = tq & pq
+    frac = (len(inter) / len(tq)) if tq else 0.0
+    return {"truth": len(tq), "tool": len(pq), "matched": len(inter), "frac": frac}
+
+
 def pr_sweep(truth_paf, tool_paf, require_strand=True, n_points=15):
     """Sweep the confidence score threshold on a scored tool PAF -> PR curve.
     Returns list of (threshold, tp, fp, fn, precision, recall, f1)."""
@@ -308,6 +332,14 @@ def main():
         name, path = spec.split("=", 1)
         pafs[name] = path
         print(f"\n=== score: {name}  ({path}) ===", flush=True)
+        ov = qname_overlap(args.truth, path)
+        print(f"[qname-check] {name}: {ov['matched']}/{ov['truth']} truth read-ids "
+              f"matched ({ov['frac'] * 100:.1f}%); tool PAF has {ov['tool']} reads",
+              flush=True)
+        if ov["truth"] and ov["frac"] < 0.5:
+            print(f"[qname-check][WARN] {name} matches <50% of truth read-ids — tool "
+                  f"and truth may be different read sets or use different id formats; "
+                  f"recall is under-counted until fixed.", flush=True)
         m = score_one(args, args.truth, path)
         print("parsed:", m, flush=True)
         rows.append((name, m))

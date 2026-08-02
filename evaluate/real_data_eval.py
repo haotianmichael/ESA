@@ -62,6 +62,74 @@ def minimap2_truth(reference_fasta: str, fastq: str, out_paf: str,
     return keep_primary_paf(raw, out_paf)
 
 
+def read_fasta_name(path: str) -> str:
+    """First record's contig name (header token up to whitespace).
+
+    This is EXACTLY the target name minimap2 and RawHash2 emit for this
+    reference, so SquiggleSeek's PAF must use the SAME name — the locus scorer
+    requires the contig to match, and a hardcoded 'ref' would never match a
+    minimap2/RawHash2 truth built from the real header (silent zero recall).
+    Warns (does not fail) on a multi-record FASTA: coordinates assume a single
+    concatenated record.
+    """
+    name = None
+    n_records = 0
+    with open(path) as f:
+        for line in f:
+            if line.startswith(">"):
+                n_records += 1
+                if name is None:
+                    tok = line[1:].strip().split()
+                    name = tok[0] if tok else "ref"
+    if n_records > 1:
+        print(f"[real][WARN] {path} has {n_records} records; coordinates assume a "
+              f"SINGLE-record reference (all sequence is concatenated). Use a "
+              f"single-contig reference for correct coordinates.", flush=True)
+    return name or "ref"
+
+
+def paf_qnames(path: str) -> set:
+    """Set of all query names (column 0) in a PAF, mapped or unmapped."""
+    q = set()
+    with open(path) as f:
+        for line in f:
+            c = line.rstrip("\n").split("\t")
+            if c and c[0]:
+                q.add(c[0])
+    return q
+
+
+def report_qname_overlap(truth_paf: str, tool_pafs: dict) -> dict:
+    """Print how many TRUTH read-ids each tool PAF covers, and return the
+    {tool: fraction} map.
+
+    pafstats / the locus scorer match reads BY QNAME, so if the tool's read ids
+    and the truth's read ids are formatted differently (e.g. one strips a suffix)
+    the intersection is empty and recall silently collapses to 0 — a bug that
+    looks like "the method is bad". Surfacing the overlap ratio makes an id
+    mismatch obvious before anyone reads the P/R/F1 table (PROMPT §六).
+    """
+    truth_q = paf_qnames(truth_paf)
+    fracs = {}
+    print(f"[qname-check] truth reads = {len(truth_q)}", flush=True)
+    for name, path in tool_pafs.items():
+        if not os.path.exists(path):
+            print(f"[qname-check] {name}: PAF not found ({path}) — skipped", flush=True)
+            continue
+        tq = paf_qnames(path)
+        inter = truth_q & tq
+        frac = (len(inter) / len(truth_q)) if truth_q else 0.0
+        fracs[name] = frac
+        print(f"[qname-check] {name}: {len(inter)}/{len(truth_q)} truth read-ids matched "
+              f"({frac * 100:.1f}%); tool PAF has {len(tq)} reads", flush=True)
+        if truth_q and frac < 0.5:
+            print(f"[qname-check][WARN] {name} matches <50% of truth read-ids — the "
+                  f"tool PAF and the truth PAF may not be the SAME read set, or the id "
+                  f"formatting differs. pafstats will under-count recall until this is "
+                  f"fixed.", flush=True)
+    return fracs
+
+
 # --------------------------------------------------------------------------- #
 def read_blow5(path: str, limit=None):
     """Read (read_id, signal) records from a blow5/slow5 into lightweight reads."""
@@ -130,14 +198,17 @@ def main():
     device = args.device if torch.cuda.is_available() else "cpu"
     store_device = "cpu" if args.faiss_cpu else device
 
-    # 1) real reads + real reference
+    # 1) real reads + real reference. The target name is taken from the reference
+    # header (NOT hardcoded 'ref') so SquiggleSeek's PAF, the minimap2 truth, and
+    # RawHash2 all name the same contig — otherwise the locus scorer never matches.
     reads = read_blow5(args.real_reads, limit=(args.limit or None))
     reference_seq = read_single_fasta(args.real_reference)
-    ref_name = "ref"
+    ref_name = read_fasta_name(args.real_reference)
     for r in reads:
         r.reference_name = ref_name
     print(f"[real] reads          = {args.real_reads}  ({len(reads)} loaded)", flush=True)
-    print(f"[real] reference      = {args.real_reference}  ({len(reference_seq)} bp)", flush=True)
+    print(f"[real] reference      = {args.real_reference}  ({len(reference_seq)} bp, "
+          f"contig='{ref_name}')", flush=True)
 
     pore = PoreModel(kmer_table_path=args.pore_model, kmer_len=args.kmer_len,
                      samples_per_kmer=args.samples_per_kmer)
@@ -184,6 +255,10 @@ def main():
         truth_src = f"minimap2 -x map-ont of basecalled reads ({n} mapped) [RawHash convention]"
     else:
         sys.exit("need --truth_paf OR --basecall_cmd for ground truth")
+
+    # 4b) qname sanity: the truth PAF and SquiggleSeek's PAF must key on the SAME
+    # read ids or pafstats matches nothing and recall reads as 0 (PROMPT §六).
+    report_qname_overlap(truth_paf, {"SquiggleSeek": ss_paf})
 
     # 5) stage ref + blow5 so RawHash2 runs on the identical inputs
     ref_out = os.path.join(args.out_dir, "ref.fasta")
