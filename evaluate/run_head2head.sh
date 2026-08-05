@@ -51,8 +51,8 @@ FAST_SWEEP="${FAST_SWEEP:-0}"        # 1 = skip random/untrained baselines (nois
 FAISS_CPU="${FAISS_CPU:-0}"          # 1 = FAISS index on CPU (avoids GPU-OOM on full-genome index)
 N_TRAIN="${N_TRAIN:-20000}"          # training reads
 TRAIN_STEPS="${TRAIN_STEPS:-2000}"   # optimizer steps (2000 = original behavior; 20000 = locked full run)
-INPUT_SIGNAL_LEN="${INPUT_SIGNAL_LEN:-3000}"  # samples/window encoded (LOCKED 3000 for the canonical model)
-N_MAMBA_BLOCKS="${N_MAMBA_BLOCKS:-12}"  # encoder depth (LOCKED 12; the A1_v3 config that reached recall@1 99.4%)
+INPUT_SIGNAL_LEN="${INPUT_SIGNAL_LEN:-2000}"  # samples/window encoded (LOCKED 2000 = verified A1_v3 default)
+N_MAMBA_BLOCKS="${N_MAMBA_BLOCKS:-6}"   # encoder depth (LOCKED 6 = verified A1_v3 default; pilot default is also 6)
 NPROC="${NPROC:-2}"                  # GPUs for DDP training (torchrun --nproc_per_node); training only
 N_QUERY="${N_QUERY:-5000}"           # eval/query reads (the head-to-head set)
 SEED="${SEED:-42}"

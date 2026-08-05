@@ -150,7 +150,7 @@ def _find_signal_start(sig, search=6000, win=200, thresh=2.5):
 
 
 def read_blow5(path: str, limit=None, trim_mode="none", trim_fixed=1000,
-               keep_min=3100):   # keep_min >= input_signal_len(3000) + margin
+               keep_min=2100):   # keep_min >= input_signal_len(2000) + margin
     import numpy as np
     import pyslow5
 

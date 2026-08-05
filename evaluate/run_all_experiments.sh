@@ -33,8 +33,8 @@ REPO="$(cd "$HERE/.." && pwd)"
 # ---- locked config (env-overridable, but overriding breaks comparability) ----
 BASE="${BASE:-/home/nfs/mahaotian/ESA}"
 ENCODER_TYPE_MAIN="${ENCODER_TYPE_MAIN:-mamba}"
-INPUT_SIGNAL_LEN="${INPUT_SIGNAL_LEN:-3000}"
-N_MAMBA_BLOCKS="${N_MAMBA_BLOCKS:-12}"   # encoder depth (LOCKED 12 = verified A1_v3; 6 under-fits to recall@1 66%)
+INPUT_SIGNAL_LEN="${INPUT_SIGNAL_LEN:-2000}"   # samples/window (LOCKED 2000 = verified A1_v3; 3000 dropped recall@1 to 66%)
+N_MAMBA_BLOCKS="${N_MAMBA_BLOCKS:-6}"    # encoder depth (LOCKED 6 = verified A1_v3 default; history shows 6 throughout)
 HARD_NEG_MAIN="${HARD_NEG_MAIN:-8}"
 OVERLAP_MAIN="${OVERLAP_MAIN:-285}"
 N_TRAIN="${N_TRAIN:-100000}"
