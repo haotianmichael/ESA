@@ -34,6 +34,7 @@ REPO="$(cd "$HERE/.." && pwd)"
 BASE="${BASE:-/home/nfs/mahaotian/ESA}"
 ENCODER_TYPE_MAIN="${ENCODER_TYPE_MAIN:-mamba}"
 INPUT_SIGNAL_LEN="${INPUT_SIGNAL_LEN:-3000}"
+N_MAMBA_BLOCKS="${N_MAMBA_BLOCKS:-12}"   # encoder depth (LOCKED 12 = verified A1_v3; 6 under-fits to recall@1 66%)
 HARD_NEG_MAIN="${HARD_NEG_MAIN:-8}"
 OVERLAP_MAIN="${OVERLAP_MAIN:-285}"
 N_TRAIN="${N_TRAIN:-100000}"
@@ -83,7 +84,7 @@ have_stage() { case " $STAGES " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
 say "run_all_experiments  ($(date))"
 echo "BASE=$BASE  OUT_ROOT=$OUT_ROOT  CKPT=$CKPT"
-echo "locked: encoder=$ENCODER_TYPE_MAIN isl=$INPUT_SIGNAL_LEN H=$HARD_NEG_MAIN overlap=$OVERLAP_MAIN"
+echo "locked: encoder=$ENCODER_TYPE_MAIN isl=$INPUT_SIGNAL_LEN n_mamba_blocks=$N_MAMBA_BLOCKS H=$HARD_NEG_MAIN overlap=$OVERLAP_MAIN"
 echo "        n_train=$N_TRAIN train_steps=$TRAIN_STEPS batch=$BATCH_SIZE seed=$SEED nproc=$NPROC"
 echo "STAGES=$STAGES  amp={$AMP_LIST} dwell={$DWELL_LIST}"
 
@@ -108,7 +109,7 @@ if have_stage 1; then
     REF_FASTA="$REF_KECOLI" REF_BP=0 \
     OUT="$STAGE1_OUT" SAVE_ENCODER="$CKPT" \
     ENCODER_TYPE="$ENCODER_TYPE_MAIN" HARD_NEG="$HARD_NEG_MAIN" OVERLAP="$OVERLAP_MAIN" \
-    INPUT_SIGNAL_LEN="$INPUT_SIGNAL_LEN" BATCH_SIZE="$BATCH_SIZE" \
+    INPUT_SIGNAL_LEN="$INPUT_SIGNAL_LEN" N_MAMBA_BLOCKS="$N_MAMBA_BLOCKS" BATCH_SIZE="$BATCH_SIZE" \
     N_TRAIN="$N_TRAIN" N_QUERY="$N_QUERY" TRAIN_STEPS="$TRAIN_STEPS" \
     FORWARD_ONLY=0 BOTH_STRANDS=1 FAST_SWEEP=0 FAISS_CPU="$FAISS_CPU" \
     NPROC="$NPROC" SEED="$SEED" SKIP_RAWHASH=0 \
@@ -177,7 +178,7 @@ run_ablation() {  # $1=tag  rest=EXTRA env assignments handled by caller
   # shared locked config; caller has exported the single ablated override
   REF_FASTA="$REF_KECOLI" REF_BP=0 \
   OUT="$out" SAVE_ENCODER="$ckpt" \
-  INPUT_SIGNAL_LEN="$INPUT_SIGNAL_LEN" BATCH_SIZE="$BATCH_SIZE" \
+  INPUT_SIGNAL_LEN="$INPUT_SIGNAL_LEN" N_MAMBA_BLOCKS="$N_MAMBA_BLOCKS" BATCH_SIZE="$BATCH_SIZE" \
   N_TRAIN="$N_TRAIN" N_QUERY="$N_QUERY" TRAIN_STEPS="$TRAIN_STEPS" \
   FORWARD_ONLY=0 BOTH_STRANDS=1 FAST_SWEEP=0 FAISS_CPU="$FAISS_CPU" \
   NPROC="$NPROC" SEED="$SEED" SKIP_RAWHASH=1 \
