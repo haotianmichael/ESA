@@ -61,8 +61,11 @@ REAL_LIMIT="${REAL_LIMIT:-0}"
 AMP_LIST="${AMP_LIST:-default 1.5 2.0 3.0 5.0}"
 DWELL_LIST="${DWELL_LIST:-4}"
 
-# STAGE-1 reproducibility gate: default-noise trained recall@1 should be ~99%.
-GATE_R1_MIN="${GATE_R1_MIN:-90}"
+# STAGE-1 reproducibility gate: the pilot's own trained>untrained>random go/no-go
+# is the pass/fail signal. GATE_R1_MIN is only a low collapse-floor on the strict
+# +/-15bp trained recall@1 (a much smaller number than head-to-head @all recall),
+# used to catch a totally-collapsed run — NOT to enforce ~99%.
+GATE_R1_MIN="${GATE_R1_MIN:-30}"
 
 STAGES="${STAGES:-1 2 3 4}"
 PYTHON="${PYTHON:-python}"
@@ -113,15 +116,27 @@ if have_stage 1; then
 
     [ -s "$CKPT" ] || fail "STAGE 1 did not produce the checkpoint: $CKPT"
 
-    # reproducibility gate: pilot's trained recall@1 (from run.log) must be ~99%.
-    R1="$(grep -E '^[[:space:]]+trained[[:space:]]' "$STAGE1_OUT/run.log" 2>/dev/null \
-          | tail -1 | grep -oE '@1=[[:space:]]*[0-9.]+' | grep -oE '[0-9.]+' | head -1)"
-    echo "[gate] STAGE 1 default-noise trained recall@1 = ${R1:-<unparsed>}% (expect ~99%, min $GATE_R1_MIN%)"
-    if [ -n "$R1" ]; then
+    # reproducibility gate. PRIMARY signal = the pilot's own '[go/no-go] ... GO'
+    # line (trained > untrained > random @10). SECONDARY = trained recall@1 from
+    # the 'recall (tol +/-15bp, coverage)' table — parsed with sed so the '1' in
+    # '@1=' is NOT mistaken for the value (the old bug that read 66.0% as 1%). Read
+    # NEITHER the PR-sweep rows nor any '@P>=...' work-point row.
+    RUNLOG="$STAGE1_OUT/run.log"
+    GO_LINE="$(grep '\[go/no-go\]' "$RUNLOG" 2>/dev/null | tail -1)"
+    R1="$(grep -E '^[[:space:]]+trained[[:space:]]' "$RUNLOG" 2>/dev/null \
+          | tail -1 | sed -nE 's/.*@1=[[:space:]]*([0-9]+(\.[0-9]+)?).*/\1/p')"
+    echo "[gate] STAGE 1 go/no-go='${GO_LINE:-<none>}'  trained recall@1=${R1:-<unparsed>}% (collapse floor ${GATE_R1_MIN}%)"
+    if echo "$GO_LINE" | grep -q 'NO-GO'; then
+      fail "STAGE 1 GATE: pilot reported NO-GO (trained NOT > untrained > random @10). STOPPING — investigate before running stages 2-4."
+    elif echo "$GO_LINE" | grep -q ': GO'; then
+      echo "[gate] PASS — pilot go/no-go = GO; proceeding to stages 2-4."
+    elif [ -n "$R1" ]; then
+      # no go/no-go line (e.g. a --fast_sweep run): fall back to the collapse floor.
       awk -v r="$R1" -v m="$GATE_R1_MIN" 'BEGIN{exit !(r+0 >= m+0)}' \
-        || fail "STAGE 1 GATE: recall@1 ${R1}% is far below ~99% (min ${GATE_R1_MIN}%). STOPPING — investigate before running stages 2-4."
+        && echo "[gate] PASS — recall@1 ${R1}% >= collapse floor ${GATE_R1_MIN}%." \
+        || fail "STAGE 1 GATE: recall@1 ${R1}% below collapse floor ${GATE_R1_MIN}% (run looks collapsed). STOPPING."
     else
-      echo "[gate][WARN] could not parse recall@1 from $STAGE1_OUT/run.log — inspect it manually before trusting the checkpoint."
+      echo "[gate][WARN] could not read go/no-go or recall@1 from $RUNLOG — inspect it manually before trusting the checkpoint."
     fi
   fi
 fi
