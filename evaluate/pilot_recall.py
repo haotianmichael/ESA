@@ -27,6 +27,7 @@ Example::
 from __future__ import annotations
 
 import argparse
+import datetime
 import os
 import sys
 from pathlib import Path
@@ -318,7 +319,12 @@ def _setup_distributed():
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size > 1:
-        dist.init_process_group(backend="nccl")
+        # Long single-rank post-processing (index build + retrieval + head-to-head)
+        # runs on rank 0 after training while other ranks have already exited. Raise
+        # the NCCL collective timeout well above its 600 s default so no lingering
+        # collective (e.g. the post-training barrier) can trip rank-1's watchdog.
+        dist.init_process_group(backend="nccl",
+                                timeout=datetime.timedelta(hours=6))
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
     return rank, world_size, local_rank

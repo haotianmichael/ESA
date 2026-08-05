@@ -164,8 +164,12 @@ else
     LAUNCH=( "$PYTHON" "$REPO/evaluate/pilot_recall.py" )
   else
     PILOT_ARGS+=( --save_encoder "$SAVE_ENCODER" )
-    echo "training a fresh encoder -> $SAVE_ENCODER  (DDP: torchrun --nproc_per_node=$NPROC)"
-    LAUNCH=( torchrun --nproc_per_node="$NPROC" "$REPO/evaluate/pilot_recall.py" )
+    # Pick a FREE rendezvous port instead of torchrun's fixed default (29500) so a
+    # leftover process from a previously crashed run (still holding 29500) cannot
+    # fail the launch with EADDRINUSE. Override with MASTER_PORT=... if needed.
+    MASTER_PORT="${MASTER_PORT:-$("$PYTHON" -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')}"
+    echo "training a fresh encoder -> $SAVE_ENCODER  (DDP: torchrun --nproc_per_node=$NPROC --master-port=$MASTER_PORT)"
+    LAUNCH=( torchrun --nproc_per_node="$NPROC" --master-port "$MASTER_PORT" "$REPO/evaluate/pilot_recall.py" )
   fi
   "${LAUNCH[@]}" "${PILOT_ARGS[@]}" || fail "pilot_recall.py failed"
 fi
