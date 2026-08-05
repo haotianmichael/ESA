@@ -50,7 +50,9 @@ REF_BP="${REF_BP:-1000000}"          # random reference length (bp) when REF_FAS
 FAST_SWEEP="${FAST_SWEEP:-0}"        # 1 = skip random/untrained baselines (noise-sweep speedup)
 FAISS_CPU="${FAISS_CPU:-0}"          # 1 = FAISS index on CPU (avoids GPU-OOM on full-genome index)
 N_TRAIN="${N_TRAIN:-20000}"          # training reads
-TRAIN_STEPS="${TRAIN_STEPS:-2000}"   # optimizer steps (2000 = original behavior)
+TRAIN_STEPS="${TRAIN_STEPS:-2000}"   # optimizer steps (2000 = original behavior; 20000 = locked full run)
+INPUT_SIGNAL_LEN="${INPUT_SIGNAL_LEN:-3000}"  # samples/window encoded (LOCKED 3000 for the canonical model)
+NPROC="${NPROC:-2}"                  # GPUs for DDP training (torchrun --nproc_per_node); training only
 N_QUERY="${N_QUERY:-5000}"           # eval/query reads (the head-to-head set)
 SEED="${SEED:-42}"
 PYTHON="${PYTHON:-python}"
@@ -142,6 +144,7 @@ else
     --ref_bp 0
     --refine none
     --n_train "$N_TRAIN" --n_query "$N_QUERY" --train_steps "$TRAIN_STEPS"
+    --input_signal_len "$INPUT_SIGNAL_LEN"
     --batch_size "$BATCH_SIZE" --hard_negatives "$HARD_NEG"
     --forward_only "$FORWARD_ONLY" --both_strands "$BOTH_STRANDS"
     --encoder_type "$ENCODER_TYPE" --overlap "$OVERLAP"
@@ -151,15 +154,19 @@ else
   )
   [ -n "$AMP_NOISE" ] && PILOT_ARGS+=( --amp_noise "$AMP_NOISE" )
   [ -n "$DWELL_STD" ] && PILOT_ARGS+=( --dwell_std "$DWELL_STD" )
-  echo "batch_size=$BATCH_SIZE  hard_negatives=$HARD_NEG  forward_only=$FORWARD_ONLY  both_strands=$BOTH_STRANDS  encoder_type=$ENCODER_TYPE  overlap=$OVERLAP  PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF"
+  echo "batch_size=$BATCH_SIZE  hard_negatives=$HARD_NEG  input_signal_len=$INPUT_SIGNAL_LEN  train_steps=$TRAIN_STEPS  forward_only=$FORWARD_ONLY  both_strands=$BOTH_STRANDS  encoder_type=$ENCODER_TYPE  overlap=$OVERLAP  PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF"
+  # Launcher: DDP (torchrun, NPROC GPUs) when TRAINING; plain python (single GPU)
+  # when loading a checkpoint (no training happens, so no cross-GPU gather needed).
   if [ -n "$LOAD_ENCODER" ] && [ -f "$LOAD_ENCODER" ]; then
     PILOT_ARGS+=( --load_encoder "$LOAD_ENCODER" )
-    echo "loading encoder: $LOAD_ENCODER (training skipped)"
+    echo "loading encoder: $LOAD_ENCODER (training skipped; single-GPU python)"
+    LAUNCH=( "$PYTHON" "$REPO/evaluate/pilot_recall.py" )
   else
     PILOT_ARGS+=( --save_encoder "$SAVE_ENCODER" )
-    echo "training a fresh encoder -> $SAVE_ENCODER"
+    echo "training a fresh encoder -> $SAVE_ENCODER  (DDP: torchrun --nproc_per_node=$NPROC)"
+    LAUNCH=( torchrun --nproc_per_node="$NPROC" "$REPO/evaluate/pilot_recall.py" )
   fi
-  "$PYTHON" "$REPO/evaluate/pilot_recall.py" "${PILOT_ARGS[@]}" || fail "pilot_recall.py failed"
+  "${LAUNCH[@]}" "${PILOT_ARGS[@]}" || fail "pilot_recall.py failed"
 fi
 
 [ -s "$OUT/ground_truth.paf" ] || fail "ground_truth.paf not produced"

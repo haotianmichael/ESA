@@ -118,43 +118,71 @@ def report_qname_overlap(truth_paf: str, tool_pafs: dict) -> dict:
             continue
         tq = paf_qnames(path)
         inter = truth_q & tq
+        frac_tool = (len(inter) / len(tq)) if tq else 0.0
         frac = (len(inter) / len(truth_q)) if truth_q else 0.0
         fracs[name] = frac
-        print(f"[qname-check] {name}: {len(inter)}/{len(truth_q)} truth read-ids matched "
-              f"({frac * 100:.1f}%); tool PAF has {len(tq)} reads", flush=True)
-        if truth_q and frac < 0.5:
-            print(f"[qname-check][WARN] {name} matches <50% of truth read-ids — the "
-                  f"tool PAF and the truth PAF may not be the SAME read set, or the id "
-                  f"formatting differs. pafstats will under-count recall until this is "
-                  f"fixed.", flush=True)
+        print(f"[qname-check] {name}: {len(inter)}/{len(tq)} tool read-ids found in truth "
+              f"({frac_tool * 100:.1f}%); {len(inter)}/{len(truth_q)} of all truth reads",
+              flush=True)
+        if tq and frac_tool < 0.5:
+            print(f"[qname-check][WARN] {name}: <50% of the tool's OWN read-ids are in the "
+                  f"truth PAF — tool and truth may be different read sets or id formats.",
+                  flush=True)
     return fracs
 
 
 # --------------------------------------------------------------------------- #
-def read_blow5(path: str, limit=None):
-    """Read (read_id, signal) records from a blow5/slow5 into lightweight reads."""
+def _find_signal_start(sig, search=6000, win=200, thresh=2.5):
+    import numpy as np
+    if len(sig) < win * 3:
+        return 0
+    seg = sig[:min(search, len(sig))].astype(np.float32)
+    stds = np.array([seg[i:i + win].std() for i in range(0, len(seg) - win, win)])
+    if len(stds) < 3:
+        return 0
+    base = float(np.median(stds[:3]))
+    if base <= 0:
+        return 0
+    for k, s in enumerate(stds):
+        if s > base * thresh:
+            return k * win
+    return 0
+
+
+def read_blow5(path: str, limit=None, trim_mode="none", trim_fixed=1000,
+               keep_min=3100):   # keep_min >= input_signal_len(3000) + margin
     import numpy as np
     import pyslow5
 
     class RealRead:
         __slots__ = ("id", "signal", "reference_name", "reference_start",
                      "reference_end", "strand")
-
         def __init__(self, rid, signal, ref_name):
-            self.id = rid
-            self.signal = signal
-            self.reference_name = ref_name
-            self.reference_start = None      # unknown for real reads
-            self.reference_end = None
-            self.strand = None
+            self.id = rid; self.signal = signal; self.reference_name = ref_name
+            self.reference_start = None; self.reference_end = None; self.strand = None
 
     s = pyslow5.Open(path, "r")
-    reads = []
+    reads = []; trims = []
     for rec in s.seq_reads(pA=True):
         sig = np.asarray(rec["signal"], dtype=np.float32)
+        if trim_mode == "fixed":
+            start = trim_fixed
+        elif trim_mode == "auto":
+            start = _find_signal_start(sig)
+        else:
+            start = 0
+        start = int(min(max(0, start), max(0, len(sig) - keep_min)))
+        trims.append(start)
+        if start:
+            sig = sig[start:]
         reads.append(RealRead(rec["read_id"], sig, None))
         if limit and len(reads) >= limit:
             break
+    if reads:
+        tr = np.asarray(trims)
+        print(f"[trim] mode={trim_mode} (fixed={trim_fixed})  trimmed samples: "
+              f"median={int(np.median(tr))} min={int(tr.min())} max={int(tr.max())} "
+              f"zero-trim={(tr == 0).sum()}/{len(tr)}", flush=True)
     return reads
 
 
@@ -177,6 +205,8 @@ def parse_args():
     p.add_argument("--basecall_cmd", default=None,
                    help="shell template with {blow5} and {fastq}, e.g. buttery-eel/dorado")
     p.add_argument("--minimap2_bin", default="minimap2")
+    p.add_argument("--trim_mode", default="none", choices=["none", "fixed", "auto"])
+    p.add_argument("--trim_fixed", type=int, default=1000)
     return p.parse_args()
 
 
@@ -201,7 +231,8 @@ def main():
     # 1) real reads + real reference. The target name is taken from the reference
     # header (NOT hardcoded 'ref') so SquiggleSeek's PAF, the minimap2 truth, and
     # RawHash2 all name the same contig — otherwise the locus scorer never matches.
-    reads = read_blow5(args.real_reads, limit=(args.limit or None))
+    reads = read_blow5(args.real_reads, limit=(args.limit or None),
+                       trim_mode=args.trim_mode, trim_fixed=args.trim_fixed)
     reference_seq = read_single_fasta(args.real_reference)
     ref_name = read_fasta_name(args.real_reference)
     for r in reads:
@@ -267,7 +298,8 @@ def main():
     if os.path.abspath(args.real_reads) != os.path.abspath(blow5_out):
         shutil.copy(args.real_reads, blow5_out)
 
-    print("\n==== real-data inputs (archive these) ====", flush=True)
+    print(f"\n==== real-data inputs (archive these) [trim_mode={args.trim_mode} "
+          f"trim_fixed={args.trim_fixed}] ====", flush=True)
     print(f"  reads.blow5   = {blow5_out}", flush=True)
     print(f"  ref.fasta     = {ref_out}", flush=True)
     print(f"  truth source  = {truth_src}", flush=True)

@@ -39,6 +39,8 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 import torch  # noqa: E402
+import torch.distributed as dist  # noqa: E402
+from torch.nn.parallel import DistributedDataParallel as DDP  # noqa: E402
 
 from dna2vec.pore_model import PoreModel  # noqa: E402
 from dna2vec.config_schema import SignalModelConfigSchema  # noqa: E402
@@ -289,6 +291,112 @@ def evaluate_random(reference_len, eval_reads, unit_length, stride, topk_list, t
     return {k: hits[k] / n for k in topk_list}, mrr / n
 
 
+# --------------------------------------------------------------------------- #
+# Distributed (DDP) helpers — cross-GPU all-gathered contrastive loss.
+#
+# The contrastive loss is built from the GLOBAL batch's in-batch negatives, so a
+# naive DDP that hands each GPU the full batch would (a) not save memory and (b)
+# change the effective batch (and thus the negative pool), breaking comparability
+# with the single-GPU batch-48 runs. Instead each GPU forwards batch/world_size
+# anchors at ``input_signal_len`` (half the memory for 2 GPUs), and we all-gather
+# the normalized embeddings into the SAME [batch, D] tensors the single-GPU path
+# builds, then compute the IDENTICAL loss over the global batch.
+# --------------------------------------------------------------------------- #
+def _dist_info():
+    """(rank, world_size, local_rank). Falls back to single-process (0, 1, 0)
+    when torchrun did not launch us (WORLD_SIZE unset) or the group is not up."""
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size(), int(os.environ.get("LOCAL_RANK", 0))
+    return 0, 1, 0
+
+
+def _setup_distributed():
+    """Init the NCCL process group iff torchrun launched >1 process. Reads
+    RANK/LOCAL_RANK/WORLD_SIZE from the environment (set by torchrun). Returns
+    (rank, world_size, local_rank); single-GPU/plain-python -> (0, 1, 0)."""
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size > 1:
+        dist.init_process_group(backend="nccl")
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+    return rank, world_size, local_rank
+
+
+def _gather_cat(t, world_size, rank):
+    """Autograd-aware all-gather along dim 0, returning the concatenation over
+    ranks in RANK ORDER (so the gathered tensor == the single-GPU batch laid out
+    rank-0-slice ++ rank-1-slice ++ ...).
+
+    Uses the MoCo-v3 / SimCLR substitution pattern: ``all_gather`` produces the
+    other ranks' slices (no grad), and this rank's own slice is spliced back in
+    grad-connected so backprop reaches the local encoder. Combined with DDP's
+    gradient averaging, the training loop scales the loss by ``world_size`` so the
+    reduced gradient equals the single-GPU batch gradient (see train loop)."""
+    if world_size == 1:
+        return t
+    gathered = [torch.empty_like(t) for _ in range(world_size)]
+    dist.all_gather(gathered, t.contiguous())
+    gathered[rank] = t  # keep this rank's slice grad-connected
+    return torch.cat(gathered, dim=0)
+
+
+def _forward_local_embeddings(encoder, pooling, x1, x2, xneg, device):
+    """One COMBINED forward over [anchors | positives | (H hard negs)] -> the
+    L2-normalized local embeddings ``y1[b,D]``, ``y2[b,D]``, ``yneg[b,H,D]|None``.
+
+    A single forward (vs three) is (a) numerically identical here — the encoder
+    and AveragePooler are per-sample (no BatchNorm), so batching does not change
+    any row — and (b) required for a clean DDP step: DDP wraps one forward per
+    backward. ``xneg=None`` (H=0) skips the negative block."""
+    b = x1["signal"].shape[0]
+    sigs = [x1["signal"], x2["signal"]]
+    masks = [x1["attention_mask"], x2["attention_mask"]]
+    H = 0
+    if xneg is not None:
+        H = xneg["signal"].shape[1]
+        L = xneg["signal"].shape[2]
+        T = xneg["attention_mask"].shape[2]
+        sigs.append(xneg["signal"].reshape(b * H, L))
+        masks.append(xneg["attention_mask"].reshape(b * H, T))
+    signal = torch.cat(sigs, 0).to(device)
+    attention_mask = torch.cat(masks, 0).to(device)
+    h = encoder(signal=signal, attention_mask=attention_mask)
+    y = pooling(h, attention_mask=attention_mask)
+    y = torch.nn.functional.normalize(y, dim=-1)
+    y1 = y[:b]
+    y2 = y[b:2 * b]
+    yneg = y[2 * b:].reshape(b, H, -1) if H > 0 else None
+    return y1, y2, yneg
+
+
+def gathered_infonce_loss(y1_local, y2_local, yneg_local, temp, world_size, rank):
+    """InfoNCE over the GLOBAL (all-gathered) batch. Returns
+    (loss, y1_global, y2_global, yneg_global).
+
+    logits = [ y1@y2.t()  (global in-batch positives, [B,B]) |
+               einsum('bd,bhd->bh', y1, yneg)  (H per-anchor hard negs) ]
+    labels = arange(B); ce(logits, labels). This is EXACTLY the single-GPU
+    ``train_encoder_hardneg`` loss when world_size==1 (gather = identity), and the
+    same math over the gathered global batch when world_size>1. H=0 -> positives
+    only (plain InfoNCE)."""
+    y1 = _gather_cat(y1_local, world_size, rank)   # [B, D]
+    y2 = _gather_cat(y2_local, world_size, rank)   # [B, D]
+    B = y1.shape[0]
+    logits_pos = (y1 @ y2.t()) / temp              # [B, B]
+    yneg = None
+    if yneg_local is not None:
+        yneg = _gather_cat(yneg_local, world_size, rank)          # [B, H, D]
+        logits_neg = torch.einsum("bd,bhd->bh", y1, yneg) / temp  # [B, H]
+        logits = torch.cat([logits_pos, logits_neg], dim=1)       # [B, B+H]
+    else:
+        logits = logits_pos
+    labels = torch.arange(B, device=logits.device)
+    loss = torch.nn.functional.cross_entropy(logits, labels)
+    return loss, y1, y2, yneg
+
+
 def run_collapse_probe(encoder, pooling, dataloader, device, args):
     """One-batch collapse probe (localizes a stuck ln(N) loss). Handles both the
     2-tuple (no hard-neg) and 3-tuple (hard-neg) collate outputs."""
@@ -325,52 +433,77 @@ def _encode_pool_norm(encoder, pooling, x, device):
 
 
 def train_encoder_hardneg(encoder, pooling, dataset, device, args):
-    """InfoNCE with near-coordinate hard negatives, implemented HERE (not in
-    trainer.py). Per anchor the logits are [in-batch positives | H hard negs]:
-    logits[i] = [cos(y1_i, y2_j) for all j] ++ [cos(y1_i, yneg_i,h) for all h],
-    label = i (positive on the diagonal). Used when --hard_negatives > 0."""
+    """InfoNCE with near-coordinate hard negatives, DDP-aware, implemented HERE
+    (not in trainer.py). Per anchor the logits are [in-batch positives | H hard
+    negs]: logits[i] = [cos(y1_i, y2_j) for all j] ++ [cos(y1_i, yneg_i,h)], label
+    = i (positive on the diagonal). H=0 -> in-batch positives only (plain InfoNCE).
+
+    Cross-GPU: each rank forwards ``batch_size // world_size`` anchors (+positives
+    +H hard negs), all-gathers the embeddings into the global [batch_size, D]
+    tensors, and computes the SAME loss over the global batch. The effective
+    contrastive batch (and its in-batch negative pool) is therefore held at
+    ``batch_size`` regardless of the GPU count — the whole point of this DDP
+    scheme (comparability with single-GPU batch-48). When world_size==1 the
+    gather is the identity and this is exactly the single-GPU path."""
     from torch.utils.data import DataLoader
     from torch.optim.lr_scheduler import OneCycleLR
 
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=signal_collate)
-    run_collapse_probe(encoder, pooling, dataloader, device, args)
+    rank, world_size, local_rank = _dist_info()
+    if args.batch_size % world_size != 0:
+        raise ValueError(
+            f"--batch_size ({args.batch_size}) must be divisible by WORLD_SIZE "
+            f"({world_size}) so the effective contrastive batch is exactly "
+            f"--batch_size (local batch = {args.batch_size}/{world_size}).")
+    local_bs = args.batch_size // world_size
+
+    # Per-rank sampling so the ranks draw DISJOINT samples (local_bs each ->
+    # batch_size unique per step). SignalPairDataset is an infinite IterableDataset
+    # (DistributedSampler is map-style only), so disjointness comes from a distinct
+    # RNG stream per rank rather than an index sampler. Seeded AFTER the probe so
+    # the probe's draws don't desync the stream.
+    dataloader = DataLoader(dataset, batch_size=local_bs, collate_fn=signal_collate)
+    if rank == 0:
+        run_collapse_probe(encoder, pooling, dataloader, device, args)
 
     encoder.to(device).train()
-    optimizer = torch.optim.Adam(encoder.parameters(), lr=args.lr)
+    if world_size > 1:
+        model = DDP(encoder, device_ids=[local_rank] if torch.cuda.is_available() else None)
+    else:
+        model = encoder
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = OneCycleLR(optimizer, max_lr=args.lr, total_steps=args.train_steps + 1)
-    ce = torch.nn.CrossEntropyLoss()
     temp = args.temperature
 
+    torch.manual_seed(args.seed * 100003 + rank)
     data_iter = iter(dataloader)
     for step in range(args.train_steps):
-        x1, x2, xneg = next(data_iter)
-        y1 = _encode_pool_norm(encoder, pooling, x1, device)   # [B, D]
-        y2 = _encode_pool_norm(encoder, pooling, x2, device)   # [B, D]
+        batch = next(data_iter)
+        if len(batch) == 3:
+            x1, x2, xneg = batch
+        else:
+            x1, x2 = batch
+            xneg = None
 
-        B, H, L = xneg["signal"].shape
-        T = xneg["attention_mask"].shape[2]
-        flat = {
-            "signal": xneg["signal"].reshape(B * H, L),
-            "attention_mask": xneg["attention_mask"].reshape(B * H, T),
-        }
-        yneg = _encode_pool_norm(encoder, pooling, flat, device).reshape(B, H, -1)  # [B,H,D]
+        y1l, y2l, ynegl = _forward_local_embeddings(model, pooling, x1, x2, xneg, device)
+        loss, _, _, _ = gathered_infonce_loss(y1l, y2l, ynegl, temp, world_size, rank)
 
-        logits_pos = (y1 @ y2.t()) / temp                              # [B, B]
-        logits_neg = torch.einsum("bd,bhd->bh", y1, yneg) / temp       # [B, H]
-        logits = torch.cat([logits_pos, logits_neg], dim=1)           # [B, B+H]
-        labels = torch.arange(B, device=device)
-        loss = ce(logits, labels)
-
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(encoder.parameters(), 1.0)
+        # DDP averages parameter grads across ranks, but every rank computes the
+        # SAME global-batch loss (not a per-shard loss), and each rank only
+        # backprops through its own gathered slice -> the averaged grad is 1/W of
+        # the single-GPU batch grad. Scale the loss by world_size so the reduced
+        # gradient equals the single-GPU batch-``batch_size`` gradient exactly.
+        (loss * world_size).backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         optimizer.zero_grad()
         scheduler.step()
 
-        if step % 100 == 0:
+        if step % 100 == 0 and rank == 0:
             lr = optimizer.param_groups[0]["lr"]
+            H = 0 if xneg is None else xneg["signal"].shape[1]
             print(f"[train] step {step} loss {loss.item():.4f} lr {lr:.2e} "
-                  f"(hardneg H={H})", flush=True)
+                  f"(hardneg H={H}, world_size={world_size}, local_bs={local_bs})",
+                  flush=True)
 
     encoder.eval()
     return encoder
@@ -733,16 +866,23 @@ def append_results_csv(csv_path, args, topk_list, rows):
 
 def main():
     args = parse_args()
+    rank, world_size, local_rank = _setup_distributed()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    device = args.device if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        device = f"cuda:{local_rank}" if world_size > 1 else args.device
+    else:
+        device = "cpu"
     topk_list = [1, 5, 10, 20, 50, 75, 100]
+
+    # Loading a checkpoint => no training (single GPU per the launch plumbing).
+    is_train = not (args.load_encoder and os.path.exists(args.load_encoder))
 
     pore_model = PoreModel(
         kmer_table_path=args.pore_model, kmer_len=args.kmer_len,
         samples_per_kmer=args.samples_per_kmer,
     )
-    if pore_model.synthetic:
+    if pore_model.synthetic and rank == 0:
         print("[warn] No pore-model table -> SYNTHETIC pore model. "
               "Plumbing smoke-test only; not a valid measurement.")
 
@@ -750,24 +890,70 @@ def main():
     if args.ref_bp and len(reference_seq) > args.ref_bp:
         reference_seq = reference_seq[: args.ref_bp]
     stride = resolve_index_stride(args)
-    print(f"[info] reference length = {len(reference_seq)} bp; device = {device}; "
-          f"index stride = {stride}; hard_negatives = {args.hard_negatives}")
+    if rank == 0:
+        print(f"[info] reference length = {len(reference_seq)} bp; device = {device}; "
+              f"world_size = {world_size}; index stride = {stride}; "
+              f"hard_negatives = {args.hard_negatives}; input_signal_len = {args.input_signal_len}")
 
     # Feed squigulator the EXACT sequence we index, as a single record, so read
-    # coordinates align with our reference_seq (coord-frame guarantee).
+    # coordinates align with our reference_seq (coord-frame guarantee). Each rank
+    # writes its OWN tempdir copy so simultaneous simulation cannot collide.
     import tempfile
     squig_fasta = write_single_record_fasta(
         reference_seq, os.path.join(tempfile.mkdtemp(prefix="pilot_ref_"), "ref.fasta")
     )
 
-    # Query reads: disjoint train / eval sets. The eval reads use a persistent
-    # work dir so their BLOW5 survives for the cascade-real basecaller.
+    # ---- training: ALL ranks (DDP cross-GPU all-gathered contrastive loss) ---
+    # Every rank simulates the SAME train reads (deterministic given the seed), so
+    # each builds an identical dataset; per-rank RNG in train_encoder_hardneg then
+    # draws disjoint samples (local_bs each -> batch_size unique/step).
+    trained_model = cfg = None
+    if is_train:
+        train_reads = simulate_reads(args, reference_seq, pore_model, args.n_train,
+                                     args.seed, "train", squig_fasta)
+        if rank == 0:
+            print(f"[info] simulated {len(train_reads)} train reads "
+                  f"(forward_only={bool(args.forward_only)})")
+        trained_model, cfg = make_signal_model(args, device)
+        dataset = SignalPairDataset(
+            query_signals=[r.signal for r in train_reads],
+            query_coords=[r.reference_start for r in train_reads],
+            query_strands=[r.strand for r in train_reads],
+            query_ends=[r.reference_end for r in train_reads],
+            reference_seq=reference_seq, pore_model=pore_model,
+            unit_length=args.unit_length,
+            input_signal_len=args.input_signal_len, downsample_factor=args.downsample_factor,
+            samples_per_kmer=args.samples_per_kmer,
+            hard_negatives=args.hard_negatives,
+            hard_neg_min_bp=args.hard_neg_min_bp, hard_neg_max_bp=args.hard_neg_max_bp,
+        )
+        # H>0 and H=0 both go through the DDP gathered-InfoNCE path (H=0 => plain
+        # in-batch InfoNCE). This keeps the hn0 ablation on the SAME batch-48 DDP
+        # trainer as the canonical model (only the ablated knob differs), which the
+        # single-GPU-only frozen ContrastiveTrainer could not provide.
+        trained_encoder = train_encoder_hardneg(
+            trained_model.encoder, trained_model.pooling, dataset, device, args)
+        trained_model.encoder = trained_encoder
+        if rank == 0 and args.save_encoder:
+            save_encoder(args.save_encoder, trained_model.encoder, cfg)
+        if world_size > 1:
+            dist.barrier()
+
+    # Non-rank-0 workers are finished once training has synced: index build, recall
+    # eval, PAF emission, cascade and save_encoder all run on rank 0 only.
+    if rank != 0:
+        if world_size > 1:
+            dist.destroy_process_group()
+        return
+
+    # ======================= RANK 0 ONLY from here ==========================
+    # Query eval reads (disjoint from train); persistent work dir so the BLOW5
+    # survives for the cascade-real basecaller / PAF export.
     eval_work_dir = tempfile.mkdtemp(prefix="pilot_eval_")
     eval_blow5 = os.path.join(eval_work_dir, "reads.blow5")
-    train_reads = simulate_reads(args, reference_seq, pore_model, args.n_train, args.seed, "train", squig_fasta)
-    eval_reads = simulate_reads(args, reference_seq, pore_model, args.n_query, args.seed + 1, "eval", squig_fasta,
-                                work_dir=eval_work_dir)
-    print(f"[info] simulated {len(train_reads)} train / {len(eval_reads)} eval reads "
+    eval_reads = simulate_reads(args, reference_seq, pore_model, args.n_query,
+                                args.seed + 1, "eval", squig_fasta, work_dir=eval_work_dir)
+    print(f"[info] simulated {len(eval_reads)} eval reads "
           f"(forward_only={bool(args.forward_only)})")
     n_distinct = len(set(r.reference_start for r in eval_reads))
     print(f"[info] distinct eval coords = {n_distinct} / {len(eval_reads)} "
@@ -788,32 +974,9 @@ def main():
         rec_untrained, mrr_untrained = evaluate_recall(
             store_u, eval_reads, topk_list, args.tol_bp, args.unit_length)
 
-    # --- trained (or loaded) encoder ---
-    if args.load_encoder and os.path.exists(args.load_encoder):
+    # --- loaded encoder (checkpoint path; training already done above) ---
+    if not is_train:
         trained_model, cfg = load_encoder(args.load_encoder, device, args)
-    else:
-        trained_model, cfg = make_signal_model(args, device)
-        dataset = SignalPairDataset(
-            query_signals=[r.signal for r in train_reads],
-            query_coords=[r.reference_start for r in train_reads],
-            query_strands=[r.strand for r in train_reads],
-            query_ends=[r.reference_end for r in train_reads],
-            reference_seq=reference_seq, pore_model=pore_model,
-            unit_length=args.unit_length,
-            input_signal_len=args.input_signal_len, downsample_factor=args.downsample_factor,
-            samples_per_kmer=args.samples_per_kmer,
-            hard_negatives=args.hard_negatives,
-            hard_neg_min_bp=args.hard_neg_min_bp, hard_neg_max_bp=args.hard_neg_max_bp,
-        )
-        if args.hard_negatives > 0:
-            trained_encoder = train_encoder_hardneg(
-                trained_model.encoder, trained_model.pooling, dataset, device, args)
-        else:
-            trained_encoder = train_encoder(
-                trained_model.encoder, trained_model.pooling, dataset, device, args)
-        trained_model.encoder = trained_encoder
-        if args.save_encoder:
-            save_encoder(args.save_encoder, trained_model.encoder, cfg)
 
     store_t = build_store(trained_model, "signal-pilot-trained", device,
                           reference_seq, pore_model, args)
@@ -912,6 +1075,9 @@ def main():
         print("=================================================================")
         h2h_csv = args.head2head_csv or (Path(__file__).resolve().parent / "squiggleseek_head2head.csv")
         append_head2head_csv(h2h_csv, args, h2h)
+
+    if world_size > 1:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
