@@ -37,6 +37,10 @@ export PORE_MODEL_PATH="$PORE_MODEL"
 TRUTH_PAF="${TRUTH_PAF:-}"          # ready-made truth, OR use BASECALL_CMD
 BASECALL_CMD="${BASECALL_CMD:-}"
 MINIMAP2="${MINIMAP2:-minimap2}"
+# Optional: write the head-to-head rows to a DEDICATED csv instead of the shared
+# evaluate/head2head_pafstats.csv (keeps isolated experiments from appending to it).
+# Empty = rawhash_compare.py's default path (unchanged legacy behavior).
+HEAD2HEAD_CSV="${HEAD2HEAD_CSV:-}"
 
 RAWHASH2="${RAWHASH2:-}"
 if [ -z "$RAWHASH2" ]; then
@@ -95,11 +99,12 @@ command -v "$RAWHASH2" >/dev/null 2>&1 || [ -x "$RAWHASH2" ] || fail "rawhash2 n
 echo "rawhash2 lines: $(wc -l < "$OUT/rawhash2_real.paf")"
 
 say "3. score both vs the real ground truth (builtin locus criterion)"
-"$PYTHON" "$HERE/rawhash_compare.py" \
-  --truth "$OUT/ground_truth_real.paf" \
-  --paf "SquiggleSeek=$OUT/squiggleseek_real.paf" \
-  --paf "RawHash2=$OUT/rawhash2_real.paf" \
-  --sweep SquiggleSeek --match_to RawHash2 --scorer builtin | tee "$OUT/SUMMARY_real.txt"
+CMP_ARGS=( --truth "$OUT/ground_truth_real.paf"
+           --paf "SquiggleSeek=$OUT/squiggleseek_real.paf"
+           --paf "RawHash2=$OUT/rawhash2_real.paf"
+           --sweep SquiggleSeek --match_to RawHash2 --scorer builtin )
+[ -n "$HEAD2HEAD_CSV" ] && CMP_ARGS+=( --csv "$HEAD2HEAD_CSV" )
+"$PYTHON" "$HERE/rawhash_compare.py" "${CMP_ARGS[@]}" | tee "$OUT/SUMMARY_real.txt"
 
 say "DONE  ($(date))"
 echo "summary -> $OUT/SUMMARY_real.txt ; full log -> $LOG"
