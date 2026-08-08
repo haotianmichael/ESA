@@ -30,6 +30,7 @@ PYTHON="${PYTHON:-python}"
 LIMIT="${LIMIT:-0}"                 # 0 = all reads; set 100 for a smoke test
 TRIM_MODE="${TRIM_MODE:-none}"      # none | fixed | auto — real ONT reads need leader/adapter trim
 TRIM_FIXED="${TRIM_FIXED:-1000}"    # samples to trim when TRIM_MODE=fixed (validated: 2500 for R9 E. coli)
+READ_IDS="${READ_IDS:-}"            # optional file of read_ids to restrict SquiggleSeek to (e.g. held-out test split)
 FAISS_CPU="${FAISS_CPU:-1}"
 PORE_MODEL="${PORE_MODEL_PATH:-$BASE/squigulator/r9_6mer_pore_model.txt}"
 export PORE_MODEL_PATH="$PORE_MODEL"
@@ -66,7 +67,7 @@ fail(){ echo "FATAL: $*"; exit 1; }
 
 say "0. config ($(date))"
 echo "reads=$REAL_READS  ref=$REAL_REF  checkpoint=$CHECKPOINT  limit=$LIMIT"
-echo "trim_mode=$TRIM_MODE  trim_fixed=$TRIM_FIXED"
+echo "trim_mode=$TRIM_MODE  trim_fixed=$TRIM_FIXED  read_ids=${READ_IDS:-<all>}"
 echo "rawhash2=$RAWHASH2  pore=$RAWHASH_PORE  preset=$RAWHASH_PRESET"
 [ -s "$REAL_READS" ] || fail "REAL_READS not found: $REAL_READS"
 [ -s "$REAL_REF" ]   || fail "REAL_REF not found: $REAL_REF"
@@ -78,6 +79,7 @@ SS_ARGS=( --real_reads "$REAL_READS" --real_reference "$REAL_REF"
           --load_encoder "$CHECKPOINT" --out_dir "$OUT"
           --faiss_cpu "$FAISS_CPU" --limit "$LIMIT" --minimap2_bin "$MINIMAP2"
           --trim_mode "$TRIM_MODE" --trim_fixed "$TRIM_FIXED" )
+[ -n "$READ_IDS" ] && SS_ARGS+=( --read_ids "$READ_IDS" )
 if [ -n "$TRUTH_PAF" ]; then
   SS_ARGS+=( --truth_paf "$TRUTH_PAF" )
 elif [ -n "$BASECALL_CMD" ]; then

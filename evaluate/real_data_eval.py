@@ -150,7 +150,7 @@ def _find_signal_start(sig, search=6000, win=200, thresh=2.5):
 
 
 def read_blow5(path: str, limit=None, trim_mode="none", trim_fixed=1000,
-               keep_min=2100):   # keep_min >= input_signal_len(2000) + margin
+               keep_min=2100, keep_ids=None):   # keep_min >= input_signal_len(2000) + margin
     import numpy as np
     import pyslow5
 
@@ -164,6 +164,8 @@ def read_blow5(path: str, limit=None, trim_mode="none", trim_fixed=1000,
     s = pyslow5.Open(path, "r")
     reads = []; trims = []
     for rec in s.seq_reads(pA=True):
+        if keep_ids is not None and rec["read_id"] not in keep_ids:
+            continue   # restrict to a specific read-id set (e.g. a held-out test split)
         sig = np.asarray(rec["signal"], dtype=np.float32)
         if trim_mode == "fixed":
             start = trim_fixed
@@ -207,6 +209,9 @@ def parse_args():
     p.add_argument("--minimap2_bin", default="minimap2")
     p.add_argument("--trim_mode", default="none", choices=["none", "fixed", "auto"])
     p.add_argument("--trim_fixed", type=int, default=1000)
+    p.add_argument("--read_ids", default=None,
+                   help="file with one read_id per line; only these reads are processed "
+                        "(e.g. a held-out test split). Default: all reads.")
     return p.parse_args()
 
 
@@ -231,8 +236,13 @@ def main():
     # 1) real reads + real reference. The target name is taken from the reference
     # header (NOT hardcoded 'ref') so SquiggleSeek's PAF, the minimap2 truth, and
     # RawHash2 all name the same contig — otherwise the locus scorer never matches.
+    keep_ids = None
+    if args.read_ids:
+        with open(args.read_ids) as _f:
+            keep_ids = {ln.strip() for ln in _f if ln.strip()}
+        print(f"[real] restricting to {len(keep_ids)} read-ids from {args.read_ids}", flush=True)
     reads = read_blow5(args.real_reads, limit=(args.limit or None),
-                       trim_mode=args.trim_mode, trim_fixed=args.trim_fixed)
+                       trim_mode=args.trim_mode, trim_fixed=args.trim_fixed, keep_ids=keep_ids)
     reference_seq = read_single_fasta(args.real_reference)
     ref_name = read_fasta_name(args.real_reference)
     for r in reads:
