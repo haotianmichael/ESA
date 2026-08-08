@@ -79,7 +79,11 @@ def parse_args():
     p.add_argument("--trim_fixed", type=int, default=2500)
     p.add_argument("--input_signal_len", type=int, default=2000)
     p.add_argument("--unit_length", type=int, default=300)
-    p.add_argument("--max_qstart", type=int, default=50, help="max 5' soft-clip (bp), both strands")
+    p.add_argument("--max_qstart", type=int, default=-1,
+                   help="max 5' soft-clip qstart (bp) for train/val positives; -1 = DISABLED. "
+                        "Real reads' adapter/leader basecalls into a large 5' soft-clip, so a "
+                        "tight cap drops ~everything; the fixed signal-trim already removes the "
+                        "adapter, so large qstart is normal and not a misalignment.")
     p.add_argument("--min_mapq", type=int, default=50)
     p.add_argument("--jitter", type=int, default=500, help="max training trim jitter (samples); sizes the length filter")
     p.add_argument("--spotcheck", type=int, default=8)
@@ -144,14 +148,15 @@ def _q_window(sig, trim_fixed, input_signal_len, downsample_factor):
     return q
 
 
-def _ref_window(reference_seq, strand, tstart, tend, unit_length, pore, args):
+def _ref_window_from_anchor(reference_seq, anchor_low, strand, unit_length, pore, args):
+    """pore-model expected-signal window for ref[anchor_low : anchor_low+unit_length]
+    (revcomp'd for '-'), preprocessed to input_signal_len. anchor_low is the LOW
+    reference coordinate of the window regardless of strand."""
     L = len(reference_seq)
+    a = int(min(max(0, anchor_low), max(0, L - unit_length)))
+    bases = reference_seq[a:a + unit_length]
     if strand == "-":
-        anchor = min(max(0, tend - unit_length), max(0, L - unit_length))
-        bases = revcomp(reference_seq[anchor:anchor + unit_length])
-    else:
-        anchor = min(max(0, tstart), max(0, L - unit_length))
-        bases = reference_seq[anchor:anchor + unit_length]
+        bases = revcomp(bases)
     ref_sig = pore.sequence_to_signal(bases)
     r, _ = preprocess_window(ref_sig, args.input_signal_len, args.downsample_factor)
     return r
@@ -179,9 +184,13 @@ def main():
         sys.exit("[stage4b][FATAL] no truth lines matched the reference contig — "
                  "check that truth.paf targets CFT073 (AE014075.1).")
 
-    # filter-pass set (train/val eligibility, PAF-only checks; length added later)
+    # filter-pass set (train/val eligibility, PAF-only checks; length added later).
+    # qstart cap is DISABLED by default (max_qstart<0): large 5' soft-clip is normal
+    # for real reads and the fixed signal-trim already removes the adapter.
+    def _qstart_ok(r):
+        return args.max_qstart < 0 or r["qstart"] <= args.max_qstart
     filter_pass = {rid for rid, r in truth.items()
-                   if r["primary"] and r["mapq"] >= args.min_mapq and r["qstart"] <= args.max_qstart}
+                   if r["primary"] and r["mapq"] >= args.min_mapq and _qstart_ok(r)}
 
     lengths, stash = scan_blow5_lengths(args.blow5, filter_pass, args.spotcheck)
     universe = sorted(lengths.keys())
@@ -209,11 +218,11 @@ def main():
                 reasons["not_primary"] += 1; continue
             if r["mapq"] < args.min_mapq:
                 reasons["low_mapq"] += 1; continue
-            if r["qstart"] > args.max_qstart:
+            if args.max_qstart >= 0 and r["qstart"] > args.max_qstart:
                 reasons["big_qstart"] += 1; continue
             if lengths.get(rid, 0) < min_len:
                 reasons["too_short"] += 1; continue
-            pairs.append((rid, r["strand"], r["tstart"], r["tend"]))
+            pairs.append((rid, r["strand"], r["tstart"], r["tend"], r["qstart"]))
         return pairs
 
     train_pairs = build_pairs(train_split)
@@ -222,16 +231,21 @@ def main():
 
     def write_pairs(path, pairs):
         with open(path, "w") as f:
-            f.write("read_id\tstrand\ttstart\ttend\n")
-            for rid, strand, ts, te in pairs:
-                f.write(f"{rid}\t{strand}\t{ts}\t{te}\n")
+            f.write("read_id\tstrand\ttstart\ttend\tqstart\n")
+            for rid, strand, ts, te, qs in pairs:
+                f.write(f"{rid}\t{strand}\t{ts}\t{te}\t{qs}\n")
 
     write_pairs(os.path.join(args.out_dir, "train_pairs.tsv"), train_pairs)
     write_pairs(os.path.join(args.out_dir, "val_pairs.tsv"), val_pairs)
     with open(os.path.join(args.out_dir, "test_reads.txt"), "w") as f:
         f.write("\n".join(test_reads) + ("\n" if test_reads else ""))
 
-    # ---- spot-check: aligned vs random-offset ref correlation -------------------
+    # ---- spot-check: which ANCHOR aligns the real query signal to the reference?
+    # Compares two candidate anchors + a random control, per read, by Pearson corr
+    # between the preprocessed real query window and the pore-model reference window:
+    #   A  '+': ref[tstart]        '-': ref[tend-ul]        (fixed trim absorbs adapter)
+    #   B  '+': ref[tstart-qstart] '-': ref[tend+qstart-ul] (qstart used as bp offset)
+    # Whichever is clearly higher than random is the correct training anchor.
     pore = PoreModel(kmer_table_path=(args.pore_model or os.environ.get("PORE_MODEL_PATH")),
                      kmer_len=args.kmer_len, samples_per_kmer=args.samples_per_kmer)
     spot = []
@@ -239,17 +253,24 @@ def main():
         print("[stage4b][WARN] synthetic pore model — spot-check corr is less meaningful "
               "(set --pore_model or $PORE_MODEL_PATH).", flush=True)
     train_ids_set = {rid for rid, *_ in train_pairs}
+    ul = args.unit_length
     for rid in list(stash.keys()):
         if rid not in train_ids_set:
             continue
         r = truth[rid]
         q = _q_window(stash[rid], args.trim_fixed, args.input_signal_len, args.downsample_factor)
-        ra = _ref_window(reference_seq, r["strand"], r["tstart"], r["tend"], args.unit_length, pore, args)
-        # random far window (>=5000 bp away, same strand) as the negative control
-        far = int(rng.integers(0, max(1, len(reference_seq) - args.unit_length)))
-        rr = _ref_window(reference_seq, r["strand"], far, far + args.unit_length, args.unit_length, pore, args)
+        if r["strand"] == "-":
+            aA = r["tend"] - ul
+            aB = (r["tend"] + r["qstart"]) - ul
+        else:
+            aA = r["tstart"]
+            aB = r["tstart"] - r["qstart"]
+        far = int(rng.integers(0, max(1, len(reference_seq) - ul)))
+        cA = _pearson(q, _ref_window_from_anchor(reference_seq, aA, r["strand"], ul, pore, args))
+        cB = _pearson(q, _ref_window_from_anchor(reference_seq, aB, r["strand"], ul, pore, args))
+        cR = _pearson(q, _ref_window_from_anchor(reference_seq, far, r["strand"], ul, pore, args))
         spot.append((rid, r["strand"], r["tstart"], r["tend"], r["qstart"], r["mapq"],
-                     int(stash[rid].shape[0]), _pearson(q, ra), _pearson(q, rr)))
+                     int(stash[rid].shape[0]), cA, cB, cR))
         if len(spot) >= args.spotcheck:
             break
 
@@ -259,8 +280,9 @@ def main():
     lines.append(f"reference contig      : {ref_contig}  ({len(reference_seq)} bp)")
     lines.append(f"blow5 reads (universe): {len(universe)}")
     lines.append(f"truth mapped reads    : {len(mapped)}")
+    _qs = "disabled" if args.max_qstart < 0 else f"<={args.max_qstart}"
     lines.append(f"filter-pass (PAF only): {len(filter_pass)}  "
-                 f"(primary & mapq>={args.min_mapq} & qstart<={args.max_qstart})")
+                 f"(primary & mapq>={args.min_mapq} & qstart {_qs})")
     lines.append(f"length filter min_len : {min_len} samples (trim {args.trim_fixed} + isl "
                  f"{args.input_signal_len} + jitter {args.jitter})")
     lines.append(f"split (90/5/5, seed {args.seed}): train={len(train_split)} val={len(val_split)} test={len(test_split)}")
@@ -268,13 +290,17 @@ def main():
     lines.append(f"TEST (mapped, unfiltered): {len(test_reads)}")
     lines.append(f"train/val drop reasons   : {reasons}")
     lines.append("")
-    lines.append("spot-check (aligned vs random ref; aligned should be clearly higher):")
-    lines.append("  read_id  strand  tstart  tend  qstart  mapq  siglen  corr_aligned  corr_random")
-    for rid, st, ts, te, qs, mq, sl, ca, cr in spot:
-        lines.append(f"  {rid}  {st}  {ts}  {te}  {qs}  {mq}  {sl}  {ca:+.3f}  {cr:+.3f}")
+    lines.append("spot-check ANCHOR corr (real query vs pore-model ref; higher = better aligned):")
+    lines.append("  A='+ tstart / - tend-ul'   B='+ tstart-qstart / - tend+qstart-ul'   R=random")
+    lines.append("  read_id  strand  tstart  tend  qstart  mapq  siglen  corr_A  corr_B  corr_R")
+    for rid, st, ts, te, qs, mq, sl, cA, cB, cR in spot:
+        lines.append(f"  {rid}  {st}  {ts}  {te}  {qs}  {mq}  {sl}  {cA:+.3f}  {cB:+.3f}  {cR:+.3f}")
     if spot:
-        ma = float(np.mean([s[7] for s in spot])); mr = float(np.mean([s[8] for s in spot]))
-        lines.append(f"  MEAN corr_aligned={ma:+.3f}  corr_random={mr:+.3f}  (aligned >> random => alignment OK)")
+        mA = float(np.mean([s[7] for s in spot]))
+        mB = float(np.mean([s[8] for s in spot]))
+        mR = float(np.mean([s[9] for s in spot]))
+        lines.append(f"  MEAN corr_A={mA:+.3f}  corr_B={mB:+.3f}  corr_R={mR:+.3f}  "
+                     f"(pick whichever of A/B is clearly > R as the Step-2 training anchor)")
     summary = "\n".join(lines)
     print(summary, flush=True)
     with open(os.path.join(args.out_dir, "split_summary.txt"), "w") as f:
