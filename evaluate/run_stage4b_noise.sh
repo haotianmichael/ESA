@@ -122,7 +122,7 @@ done
 
 # ---- plot -------------------------------------------------------------------
 say "plot F1-vs-k"
-PNG="$OUT_ROOT/noise_curve_real.png"
+PNG="${PNG:-$OUT_ROOT/noise_curve_${NOISE_MODE}.png}"
 "$PYTHON" "$HERE/plot_stage4b_noise.py" --csv "$NOISE_CSV" --out "$PNG" \
   || echo "[warn] plotting failed (matplotlib?); CSV is still at $NOISE_CSV"
 
