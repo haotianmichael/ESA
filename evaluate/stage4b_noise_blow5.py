@@ -65,15 +65,15 @@ def main():
     sin = pyslow5.Open(args.in_blow5, "r")
     sout = pyslow5.Open(args.out_blow5, "w")
 
-    # --- header: best-effort copy (per-record scaling is what mapping needs) ------
+    # --- header ------------------------------------------------------------------
+    # get_empty_header() returns a dict whose values are None; write_header encodes
+    # every value, so None -> '<NoneType>.encode' crash. This blow5's run-metadata
+    # header attrs are absent anyway (and not needed for mapping — the per-record
+    # digitisation/offset/range/sampling_rate are), so coerce every field to a
+    # string (empty for the missing ones).
     header = sout.get_empty_header()          # UNVERIFIED pyslow5 write API
-    try:
-        for n in list(header.keys()):
-            v = sin.get_header_value(n)       # read_group 0
-            if v is not None:
-                header[n] = v
-    except Exception as e:                      # noqa: BLE001
-        print(f"[noise][warn] header copy skipped ({e}); writing default header", flush=True)
+    for n in list(header.keys()):
+        header[n] = "" if header[n] is None else str(header[n])
     sout.write_header(header)                  # UNVERIFIED
 
     n_in = n_out = n_noised = n_flat = 0
