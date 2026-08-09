@@ -47,6 +47,13 @@ def parse_args():
     p.add_argument("--in_blow5", required=True)
     p.add_argument("--out_blow5", required=True)
     p.add_argument("--k", type=float, required=True, help="noise level: sigma = k*MAD(raw); k=0 = lossless copy")
+    p.add_argument("--noise_mode", default="white", choices=["white", "event"],
+                   help="white = per-sample i.i.d. Gaussian (RawHash2's event-mean averages it "
+                        "~sqrt(block) down -> unfair to SS); event = block-constant offset (one z "
+                        "per length-`block` run, constant within it -> survives event averaging, "
+                        "the honest analogue of STAGE2 amp_noise).")
+    p.add_argument("--block", type=int, default=9,
+                   help="event-mode block length in samples (~dwell_mean); free to sweep.")
     p.add_argument("--read_ids", default=None, help="optional file of read_ids to keep (subset)")
     p.add_argument("--base_seed", type=int, default=42)
     return p.parse_args()
@@ -89,7 +96,13 @@ def main():
             med = float(np.median(raw))
             mad = float(np.median(np.abs(raw - med)))
             if mad > 0:
-                z = np.random.default_rng(_read_seed(args.base_seed, rid)).standard_normal(len(raw))
+                rng = np.random.default_rng(_read_seed(args.base_seed, rid))  # nested: same z across k
+                if args.noise_mode == "event":
+                    L = max(1, args.block)
+                    n_blocks = (len(raw) + L - 1) // L
+                    z = np.repeat(rng.standard_normal(n_blocks), L)[:len(raw)]  # block-constant; tail shares z[-1]
+                else:
+                    z = rng.standard_normal(len(raw))
                 raw = raw + np.round(args.k * mad * z)
                 n_noised += 1
             else:
@@ -126,7 +139,8 @@ def main():
         sys.exit(2)
 
     print(f"[noise] in={n_in} written={n_out} reopened={n_check} noised={n_noised} "
-          f"flat_skipped={n_flat}  k={args.k} base_seed={args.base_seed}", flush=True)
+          f"flat_skipped={n_flat}  mode={args.noise_mode} block={args.block} "
+          f"k={args.k} base_seed={args.base_seed}", flush=True)
     for rid, s0, s1 in stds:
         print(f"[noise][spotcheck] {rid}: std {s0:.1f} -> {s1:.1f}  (ratio {s1/max(s0,1e-9):.3f})", flush=True)
     if n_out != n_check:

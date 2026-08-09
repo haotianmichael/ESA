@@ -34,6 +34,8 @@ V2="$BASE/CALL_ESA/experiments/stage4b_finetune/real_encoder_v1.pt"   # F1=91.6 
 OUT_ROOT="${OUT_ROOT:-$BASE/CALL_ESA/experiments/stage4b_noise}"
 NOISE_CSV="${NOISE_CSV:-$REPO/evaluate/stage4b_noise.csv}"
 K_LIST="${K_LIST:-0.0 0.5 1.0 1.5 2.0}"
+NOISE_MODE="${NOISE_MODE:-white}"      # white (per-sample) | event (block-constant, survives event-mean)
+BLOCK="${BLOCK:-9}"                    # event-mode block length (~dwell_mean); free to sweep
 BASE_SEED="${BASE_SEED:-42}"
 EXPECT_N="${EXPECT_N:-17570}"          # Step 3 test read count
 GATE_RH_MIN="${GATE_RH_MIN:-95}"       # k=0 RawHash2 F1 must be ~97.2
@@ -47,7 +49,7 @@ fail() { echo "FATAL: $*"; exit 1; }
 
 say "STAGE4b noise sweep  ($(date))"
 echo "v2 checkpoint = $V2"
-echo "k list = {$K_LIST}  base_seed=$BASE_SEED  csv=$NOISE_CSV"
+echo "k list = {$K_LIST}  noise_mode=$NOISE_MODE  block=$BLOCK  base_seed=$BASE_SEED  csv=$NOISE_CSV"
 [ -s "$FULL_B5" ] || fail "full blow5 missing: $FULL_B5"
 [ -s "$REF" ]     || fail "reference missing: $REF"
 [ -s "$TEST_IDS" ]|| fail "test read-id list missing: $TEST_IDS (run Step 1)"
@@ -88,20 +90,22 @@ echo "test.blow5 reads = $N_TEST  (expect $EXPECT_N)"
 
 # ---- sweep ------------------------------------------------------------------
 for k in $K_LIST; do
-  KD="$OUT_ROOT/k${k}"
-  say "noise level k=$k -> $KD"
+  KD="$OUT_ROOT/k${k}_L${BLOCK}"
+  say "noise level k=$k (mode=$NOISE_MODE block=$BLOCK) -> $KD"
   mkdir -p "$KD"
   NB5="$KD/noised.blow5"
   # k=0 goes through the pyslow5 writer too (lossless) so the self-check validates it
   "$PYTHON" "$HERE/stage4b_noise_blow5.py" --in_blow5 "$TESTB5" --out_blow5 "$NB5" \
-    --k "$k" --base_seed "$BASE_SEED" || fail "noise write failed at k=$k"
+    --k "$k" --noise_mode "$NOISE_MODE" --block "$BLOCK" --base_seed "$BASE_SEED" \
+    || fail "noise write failed at k=$k"
 
   REAL_READS="$NB5" REAL_REF="$REF" TRUTH_PAF="$TEST_TRUTH" READ_IDS="$TEST_IDS" \
   CHECKPOINT="$V2" OUT="$KD" TRIM_MODE=fixed TRIM_FIXED=2500 LIMIT=0 FAISS_CPU=1 \
   HEAD2HEAD_CSV="$KD/head2head.csv" \
     bash "$HERE/run_real_data.sh" || fail "head-to-head failed at k=$k"
 
-  "$PYTHON" "$HERE/stage4b_noise_point.py" --summary "$KD/SUMMARY_real.txt" --k "$k" --csv "$NOISE_CSV" \
+  "$PYTHON" "$HERE/stage4b_noise_point.py" --summary "$KD/SUMMARY_real.txt" --k "$k" \
+    --noise_mode "$NOISE_MODE" --block "$BLOCK" --csv "$NOISE_CSV" \
     || fail "scoring/append failed at k=$k"
 
   # ---- k=0 GATE: must reproduce Step 3 ----

@@ -24,9 +24,13 @@ def main():
     args = ap.parse_args()
 
     series = defaultdict(list)  # method -> [(k, value), ...]
+    blocks = set()
     with open(args.csv) as f:
         for row in csv.DictReader(f):
             series[row["method"]].append((float(row["k_noise"]), float(row[args.metric])))
+            if row.get("block"):
+                blocks.add(row["block"])
+    block_lbl = f", block={sorted(blocks)[0]}" if len(blocks) == 1 else ""
 
     plt.figure(figsize=(6.4, 4.4))
     styles = {"SquiggleSeek": dict(marker="o", color="#1f77b4"),
@@ -37,7 +41,7 @@ def main():
         ys = [p[1] * 100 for p in pts]
         plt.plot(xs, ys, label=method, linewidth=2, **styles.get(method, {}))
 
-    plt.xlabel("additive Gaussian noise on real reads  (k x read MAD)")
+    plt.xlabel(f"event-level amplitude noise on real reads  (k x read MAD{block_lbl})")
     plt.ylabel(f"{args.metric.upper()} (%)")
     plt.title("Real-read noise robustness: SquiggleSeek vs RawHash2")
     plt.ylim(0, 100)

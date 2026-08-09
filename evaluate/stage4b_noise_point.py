@@ -42,6 +42,8 @@ def main():
     ap.add_argument("--summary", required=True, help="k{K}/SUMMARY_real.txt")
     ap.add_argument("--k", type=float, required=True)
     ap.add_argument("--csv", required=True, help="evaluate/stage4b_noise.csv")
+    ap.add_argument("--noise_mode", default="white")
+    ap.add_argument("--block", type=int, default=0)
     args = ap.parse_args()
 
     rows = parse_summary(args.summary)
@@ -49,7 +51,8 @@ def main():
         raise SystemExit(f"[noise-point][FATAL] could not parse head-to-head rows from {args.summary} "
                          f"(found: {sorted(rows)})")
 
-    header = ["timestamp", "method", "k_noise", "tp", "fp", "fn", "precision", "recall", "f1"]
+    header = ["timestamp", "method", "noise_mode", "block", "k_noise",
+              "tp", "fp", "fn", "precision", "recall", "f1"]
     write_header = not os.path.exists(args.csv)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(args.csv, "a", newline="") as f:
@@ -58,7 +61,7 @@ def main():
             w.writerow(header)
         for method in ("SquiggleSeek", "RawHash2"):
             m = rows[method]
-            w.writerow([ts, method, args.k, m["tp"], m["fp"], m["fn"],
+            w.writerow([ts, method, args.noise_mode, args.block, args.k, m["tp"], m["fp"], m["fn"],
                         f"{m['precision']:.4f}", f"{m['recall']:.4f}", f"{m['f1']:.4f}"])
     print(f"[noise-point] k={args.k}  SS F1={rows['SquiggleSeek']['f1']}  "
           f"RawHash2 F1={rows['RawHash2']['f1']}  -> {args.csv}", flush=True)
