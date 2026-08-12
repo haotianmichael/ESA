@@ -47,6 +47,10 @@ MINIMAP2="${MINIMAP2:-minimap2}"
 MINIASM="${MINIASM:-miniasm}"
 PYTHON="${PYTHON:-python}"
 DEVICE="${DEVICE:-cuda:0}"
+# Phase 3: when set, reuse this pre-built overlap truth instead of rebuilding it
+# from SUBSET_FASTA. The noise sweep builds the mm2 truth ONCE from the CLEAN
+# basecalled reads and must keep it FIXED across all k (we never re-basecall).
+FIXED_TRUTH_PAF="${FIXED_TRUTH_PAF:-}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # evaluate/
 RUN="${OUTDIR}/run_$(date +%Y%m%d_%H%M%S)"
@@ -82,9 +86,14 @@ RAW_PAF="$RUN/rawsamble.paf"
 # --------------------------------------------------------------------------- #
 # 3) Overlap TRUTH: minimap2 ava-ont (forward-only) on the subset FASTA
 # --------------------------------------------------------------------------- #
-echo "[h2h] === minimap2 ava-ont overlap truth ==="
-"$MINIMAP2" -x ava-ont --for-only -t "$THREADS" "$SUBSET_FASTA" "$SUBSET_FASTA" \
-  > "$RUN/mm2_overlaps.paf" 2> "$RUN/mm2_overlaps.log"
+if [[ -n "$FIXED_TRUTH_PAF" && -s "$FIXED_TRUTH_PAF" ]]; then
+  echo "[h2h] === using FIXED overlap truth: $FIXED_TRUTH_PAF ==="
+  cp "$FIXED_TRUTH_PAF" "$RUN/mm2_overlaps.paf"   # snapshot into the run dir for provenance
+else
+  echo "[h2h] === minimap2 ava-ont overlap truth ==="
+  "$MINIMAP2" -x ava-ont --for-only -t "$THREADS" "$SUBSET_FASTA" "$SUBSET_FASTA" \
+    > "$RUN/mm2_overlaps.paf" 2> "$RUN/mm2_overlaps.log"
+fi
 TRUTH_PAF="$RUN/mm2_overlaps.paf"
 
 # --------------------------------------------------------------------------- #
