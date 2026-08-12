@@ -132,13 +132,34 @@ for tag in neurosamble rawsamble mm2; do
 done
 
 echo "[h2h] === chained read % (run_minimap2_multimap.sh + evaluate_gfa.py) ==="
-bash "$SCRIPTS_DIR/run_minimap2_multimap.sh" "$REF" "$SUBSET_FASTA" "$THREADS" \
-  > "$RUN/true_mappings.paf" 2> "$RUN/true_mappings.log" || true
+# RawHash signature: run_minimap2_multimap.sh OUTDIR READS REF THREAD
+# (it writes ${OUTDIR}/true_mappings.paf itself -- do NOT redirect stdout).
+bash "$SCRIPTS_DIR/run_minimap2_multimap.sh" "$RUN" "$SUBSET_FASTA" "$REF" "$THREADS" \
+  2> "$RUN/true_mappings.log" || true
 for tag in neurosamble rawsamble; do
   GFA="$RUN/${tag}.gfa"
-  [[ -s "$GFA" ]] || continue
+  [[ -s "$GFA" ]] || { echo "[h2h] $GFA empty; skip chained% for $tag"; continue; }
   echo "---- $tag ----"                                                    | tee -a "$RUN/chained_reads.out"
   "$PYTHON" "$SCRIPTS_DIR/evaluate_gfa.py" "$GFA" "$RUN/true_mappings.paf"  2>&1 | tee -a "$RUN/chained_reads.out" || true
 done
 
+# --------------------------------------------------------------------------- #
+# Final summary: cat every headline result so the whole run is visible at once
+# (the pafstats throughput ZeroDivisionError -- from our mt:f:0.0 placeholder --
+# lands AFTER the metrics, so grepping the metric lines keeps the summary clean).
+# --------------------------------------------------------------------------- #
+echo ""
+echo "############################ SUMMARY ############################"
+echo "run dir: $RUN"
+echo "----- overlap P/R/F1 : Neurosamble -----"
+grep -E 'TP:|Precision|Recall|F1 Score' "$RUN/pafstats_neurosamble.err" 2>/dev/null || true
+echo "----- overlap P/R/F1 : Rawsamble  -----"
+grep -E 'TP:|Precision|Recall|F1 Score' "$RUN/pafstats_rawsamble.err" 2>/dev/null || true
+echo "----- assembly GFAs -----"
+ls -l "$RUN"/*.gfa 2>/dev/null || true
+echo "----- contiguity (analyze_gfa / AUN / N50) -----"
+cat "$RUN/contiguity.out" 2>/dev/null || true
+echo "----- chained read % -----"
+cat "$RUN/chained_reads.out" 2>/dev/null || true
+echo "################################################################"
 echo "[h2h] STAGE B complete. All outputs under: $RUN"
