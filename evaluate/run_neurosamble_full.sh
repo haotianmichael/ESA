@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Neurosamble Phase 4 -- FULL-SCALE all-vs-all head-to-head (no subsampling).
+#
+# Full D1 read set (~353k reads). Neurosamble map step is the scale path:
+#   2-GPU sharded encode -> CPU IVF index (checkpointed) -> streaming query.
+# Rawsamble / minimap2-truth / miniasm / pafstats / evaluate_gfa wiring mirrors
+# run_neurosamble_head2head.sh. All outputs under OUTDIR; encode+index are
+# checkpointed so a re-run RESUMES rather than recomputes. The encoder is NOT
+# loaded during the query phase.
+#
+# Positional args:
+#   1 OUTDIR         output root (checkpoints live here; not timestamped)
+#   2 REAL_BLOW5     full blow5 (ALL reads)
+#   3 READS_FASTA    full basecalled reads (truth + miniasm sequences)
+#   4 REF            full CFT073 (AE014075.1) reference (chained %)
+#   5 PORE           ONT pore model (rawhash2 -p)
+#   6 RAWHASH2_BIN   rawhash2 binary
+#   7 THREADS        thread count (faiss + tools)
+#   8 SCRIPTS_DIR    RawHash test/scripts dir
+#   9 NUM_GPUS       (optional, default 2)
+#  10 NPROBE         (optional, default 64)
+#  11 INDEX_TYPE     (optional, default ivfflat; or ivfpq)
+#  12 DO_ASSEMBLY    (optional, default 1)
+#
+# Required env: LOAD_ENCODER=<encoder .pt>
+# Optional env: MINIASM, MINIMAP2, PYTHON, TORCHRUN, SAMPLES_PER_KMER (9)
+# =============================================================================
+set -euo pipefail
+
+if [[ $# -lt 8 ]]; then
+  echo "usage: $0 OUTDIR REAL_BLOW5 READS_FASTA REF PORE RAWHASH2_BIN THREADS SCRIPTS_DIR [NUM_GPUS] [NPROBE] [INDEX_TYPE] [DO_ASSEMBLY]" >&2
+  echo "       (env: LOAD_ENCODER=<encoder.pt> required)" >&2
+  exit 2
+fi
+
+OUTDIR="$1"; REAL_BLOW5="$2"; READS_FASTA="$3"; REF="$4"
+PORE="$5"; RAWHASH2_BIN="$6"; THREADS="$7"; SCRIPTS_DIR="$8"
+NUM_GPUS="${9:-2}"; NPROBE="${10:-64}"; INDEX_TYPE="${11:-ivfflat}"; DO_ASSEMBLY="${12:-1}"
+
+: "${LOAD_ENCODER:?set LOAD_ENCODER=<path to encoder .pt>}"
+MINIASM="${MINIASM:-miniasm}"
+MINIMAP2="${MINIMAP2:-minimap2}"
+PYTHON="${PYTHON:-python}"
+TORCHRUN="${TORCHRUN:-torchrun}"
+SPK="${SAMPLES_PER_KMER:-9}"
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # evaluate/
+mkdir -p "$OUTDIR" "$OUTDIR/encode" "$OUTDIR/index"
+NEURO_PAF="$OUTDIR/neurosamble.paf"
+RAW_PAF="$OUTDIR/rawsamble.paf"
+TRUTH_PAF="$OUTDIR/mm2_overlaps.paf"
+echo "[full] OUTDIR=$OUTDIR NUM_GPUS=$NUM_GPUS NPROBE=$NPROBE INDEX_TYPE=$INDEX_TYPE DO_ASSEMBLY=$DO_ASSEMBLY THREADS=$THREADS SPK=$SPK"
+
+# --------------------------------------------------------------------------- #
+# 1) Neurosamble scale path: encode (2 GPU) -> IVF (CPU) -> streaming query
+# --------------------------------------------------------------------------- #
+echo "[full] === encode (2-GPU sharded) ==="
+T_ENC0=$SECONDS
+"$TORCHRUN" --nproc_per_node="$NUM_GPUS" "$HERE/overlap_encode_mp.py" \
+  --real_reads "$REAL_BLOW5" --load_encoder "$LOAD_ENCODER" \
+  --out_dir "$OUTDIR/encode" --win 2000 --stride 1000 \
+  2>&1 | tee "$OUTDIR/encode.log"
+ENCODE_SEC=$((SECONDS - T_ENC0))
+
+echo "[full] === IVF index build (CPU, checkpointed) ==="
+T_IDX0=$SECONDS
+"$PYTHON" "$HERE/overlap_index_ivf.py" \
+  --encode_dir "$OUTDIR/encode" --out_dir "$OUTDIR/index" \
+  --index_type "$INDEX_TYPE" --threads "$THREADS" \
+  2>&1 | tee "$OUTDIR/index.log"
+INDEX_SEC=$((SECONDS - T_IDX0))
+
+echo "[full] === streaming query + chaining ==="
+"$PYTHON" "$HERE/overlap_map_full.py" \
+  --index_dir "$OUTDIR/index" --encode_dir "$OUTDIR/encode" \
+  --out_paf "$NEURO_PAF" --nprobe "$NPROBE" --topk 10 \
+  --threads "$THREADS" --samples_per_kmer "$SPK" \
+  2>&1 | tee "$OUTDIR/query.log"
+
+# --------------------------------------------------------------------------- #
+# 2) Rawsamble on the SAME full blow5
+# --------------------------------------------------------------------------- #
+echo "[full] === Rawsamble (rawhash2 -x ava) ==="
+"$RAWHASH2_BIN" -x ava -t "$THREADS" -p "$PORE" -d "$OUTDIR/rawsamble_idx" "$REAL_BLOW5" \
+  2>&1 | tee "$OUTDIR/rawsamble_index.log"
+"$RAWHASH2_BIN" -x ava -t "$THREADS" "$OUTDIR/rawsamble_idx" "$REAL_BLOW5" \
+  > "$RAW_PAF" 2> "$OUTDIR/rawsamble_map.log"
+
+# --------------------------------------------------------------------------- #
+# 3) Overlap truth (minimap2 ava-ont, forward-only) on the full FASTA
+# --------------------------------------------------------------------------- #
+echo "[full] === minimap2 ava-ont overlap truth ==="
+"$MINIMAP2" -x ava-ont --for-only -t "$THREADS" "$READS_FASTA" "$READS_FASTA" \
+  > "$TRUTH_PAF" 2> "$OUTDIR/mm2_overlaps.log"
+
+# --------------------------------------------------------------------------- #
+# 4) Overlap scoring
+# --------------------------------------------------------------------------- #
+echo "[full] === pafstats: Neurosamble vs truth ==="
+"$PYTHON" "$SCRIPTS_DIR/pafstats.py" "$NEURO_PAF" "$TRUTH_PAF" \
+  > "$OUTDIR/pafstats_neurosamble.out" 2> "$OUTDIR/pafstats_neurosamble.err" || true
+echo "[full] === pafstats: Rawsamble vs truth ==="
+"$PYTHON" "$SCRIPTS_DIR/pafstats.py" "$RAW_PAF" "$TRUTH_PAF" \
+  > "$OUTDIR/pafstats_rawsamble.out" 2> "$OUTDIR/pafstats_rawsamble.err" || true
+echo "[full] ---- pafstats (Neurosamble) ----"; cat "$OUTDIR/pafstats_neurosamble.err" || true
+echo "[full] ---- pafstats (Rawsamble)  ----"; cat "$OUTDIR/pafstats_rawsamble.err"  || true
+
+if [[ "$DO_ASSEMBLY" != "0" ]]; then
+  # ------------------------------------------------------------------------- #
+  # 5) Assembly + contiguity
+  # ------------------------------------------------------------------------- #
+  echo "[full] === miniasm assembly ==="
+  for tag in neurosamble rawsamble mm2; do
+    case "$tag" in
+      neurosamble) PAF="$NEURO_PAF" ;;
+      rawsamble)   PAF="$RAW_PAF" ;;
+      mm2)         PAF="$TRUTH_PAF" ;;
+    esac
+    "$MINIASM" -f "$READS_FASTA" "$PAF" > "$OUTDIR/${tag}.gfa" 2> "$OUTDIR/${tag}_miniasm.log" || true
+  done
+
+  echo "[full] === contiguity (analyze_gfa.sh + compute_aun.py + N50) ==="
+  for tag in neurosamble rawsamble mm2; do
+    GFA="$OUTDIR/${tag}.gfa"
+    [[ -s "$GFA" ]] || { echo "[full] $GFA empty; skipping"; continue; }
+    echo "---- $tag ----"                                          | tee -a "$OUTDIR/contiguity.out"
+    bash "$SCRIPTS_DIR/analyze_gfa.sh" "$GFA"                       2>&1 | tee -a "$OUTDIR/contiguity.out" || true
+    "$PYTHON" "$SCRIPTS_DIR/compute_aun.py" "$GFA"                  2>&1 | tee -a "$OUTDIR/contiguity.out" || true
+    "$PYTHON" "$HERE/gfa_n50.py" "$GFA"                            2>&1 | tee -a "$OUTDIR/contiguity.out"
+  done
+
+  # ------------------------------------------------------------------------- #
+  # 6) Chained read %
+  # ------------------------------------------------------------------------- #
+  echo "[full] === chained read % ==="
+  bash "$SCRIPTS_DIR/run_minimap2_multimap.sh" "$OUTDIR" "$READS_FASTA" "$REF" "$THREADS" \
+    2> "$OUTDIR/true_mappings.log" || true
+  for tag in neurosamble rawsamble; do
+    GFA="$OUTDIR/${tag}.gfa"
+    [[ -s "$GFA" ]] || { echo "[full] $GFA empty; skip chained% for $tag"; continue; }
+    echo "---- $tag ----"                                                        | tee -a "$OUTDIR/chained_reads.out"
+    "$PYTHON" "$SCRIPTS_DIR/evaluate_gfa.py" "$GFA" "$OUTDIR/true_mappings.paf"   2>&1 | tee -a "$OUTDIR/chained_reads.out" || true
+  done
+fi
+
+# --------------------------------------------------------------------------- #
+# 7) SUMMARY + phase4_summary.csv
+# --------------------------------------------------------------------------- #
+echo "[full] === summary ==="
+"$PYTHON" "$HERE/overlap_full_summary.py" \
+  --run_dir "$OUTDIR" --encode_sec "$ENCODE_SEC" --index_sec "$INDEX_SEC" \
+  2>&1 | tee "$OUTDIR/summary.log"
+
+echo ""
+echo "############################ PHASE 4 SUMMARY ############################"
+echo "OUTDIR=$OUTDIR  encode_sec=$ENCODE_SEC  index_sec=$INDEX_SEC"
+cat "$OUTDIR/phase4_summary.csv" 2>/dev/null || true
+echo "########################################################################"
+echo "[full] DONE. Outputs under: $OUTDIR"
