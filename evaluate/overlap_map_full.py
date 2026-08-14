@@ -141,16 +141,23 @@ def main():
     N = windows.shape[0]
 
     index = faiss.read_index(os.path.join(args.index_dir, "ivf.index"))
+    # Set nprobe on the CPU IVF index FIRST -- it propagates into the GPU clone.
+    # (A sharded GPU IndexShards has no settable .nprobe / ParameterSpace hook.)
+    try:
+        index.nprobe = args.nprobe
+    except Exception:
+        faiss.ParameterSpace().set_index_parameter(index, "nprobe", args.nprobe)
     if args.faiss_gpu:
         print("[map] sharding index across all GPUs (exact IVFFlat, fp16)", flush=True)
         co = faiss.GpuMultipleClonerOptions()
         co.shard = True
         co.useFloat16 = True
         index = faiss.index_cpu_to_all_gpus(index, co=co)
-    try:
-        index.nprobe = args.nprobe
-    except Exception:
-        faiss.ParameterSpace().set_index_parameter(index, "nprobe", args.nprobe)
+        # Best-effort: also set nprobe on the GPU shards (GPU has its own API).
+        try:
+            faiss.GpuParameterSpace().set_index_parameter(index, "nprobe", args.nprobe)
+        except Exception:
+            pass
     print(f"[map] N_windows={N} nprobe={args.nprobe} topk={args.topk} spk={spk} win_bp={win_bp} "
           f"gpu={args.faiss_gpu} thresholds(mcs={args.min_chaining_score},"
           f"mna={args.min_num_anchors},gap={args.max_gap_bp},bw={args.bw_bp})", flush=True)
