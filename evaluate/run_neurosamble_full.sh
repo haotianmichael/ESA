@@ -86,17 +86,25 @@ echo "[full] === streaming query + chaining ==="
 # 2) Rawsamble on the SAME full blow5
 # --------------------------------------------------------------------------- #
 echo "[full] === Rawsamble (rawhash2 -x ava) ==="
-"$RAWHASH2_BIN" -x ava -t "$THREADS" -p "$PORE" -d "$OUTDIR/rawsamble_idx" "$REAL_BLOW5" \
-  2>&1 | tee "$OUTDIR/rawsamble_index.log"
-"$RAWHASH2_BIN" -x ava -t "$THREADS" "$OUTDIR/rawsamble_idx" "$REAL_BLOW5" \
-  > "$RAW_PAF" 2> "$OUTDIR/rawsamble_map.log"
+if [[ -s "$RAW_PAF" ]]; then
+  echo "[full] reuse existing rawsamble.paf (topk-independent): $RAW_PAF"
+else
+  "$RAWHASH2_BIN" -x ava -t "$THREADS" -p "$PORE" -d "$OUTDIR/rawsamble_idx" "$REAL_BLOW5" \
+    2>&1 | tee "$OUTDIR/rawsamble_index.log"
+  "$RAWHASH2_BIN" -x ava -t "$THREADS" "$OUTDIR/rawsamble_idx" "$REAL_BLOW5" \
+    > "$RAW_PAF" 2> "$OUTDIR/rawsamble_map.log"
+fi
 
 # --------------------------------------------------------------------------- #
 # 3) Overlap truth (minimap2 ava-ont, forward-only) on the full FASTA
 # --------------------------------------------------------------------------- #
 echo "[full] === minimap2 ava-ont overlap truth ==="
-"$MINIMAP2" -x ava-ont --for-only -t "$THREADS" "$READS_FASTA" "$READS_FASTA" \
-  > "$TRUTH_PAF" 2> "$OUTDIR/mm2_overlaps.log"
+if [[ -s "$TRUTH_PAF" ]]; then
+  echo "[full] reuse existing mm2_overlaps.paf (topk-independent truth): $TRUTH_PAF"
+else
+  "$MINIMAP2" -x ava-ont --for-only -t "$THREADS" "$READS_FASTA" "$READS_FASTA" \
+    > "$TRUTH_PAF" 2> "$OUTDIR/mm2_overlaps.log"
+fi
 
 # --------------------------------------------------------------------------- #
 # 4) Overlap scoring
@@ -121,7 +129,13 @@ if [[ "$DO_ASSEMBLY" != "0" ]]; then
       rawsamble)   PAF="$RAW_PAF" ;;
       mm2)         PAF="$TRUTH_PAF" ;;
     esac
-    "$MINIASM" -f "$READS_FASTA" "$PAF" > "$OUTDIR/${tag}.gfa" 2> "$OUTDIR/${tag}_miniasm.log" || true
+    # Sanitize first: miniasm SIGABRTs on self-hits / degenerate coords / reads
+    # missing from the FASTA (this is why rawsamble.gfa kept coming out empty).
+    "$PYTHON" "$HERE/sanitize_paf.py" --in_paf "$PAF" \
+      --out_paf "$OUTDIR/${tag}.clean.paf" --reads_fasta "$READS_FASTA" \
+      2>&1 | tee -a "$OUTDIR/sanitize.log"
+    "$MINIASM" -f "$READS_FASTA" "$OUTDIR/${tag}.clean.paf" \
+      > "$OUTDIR/${tag}.gfa" 2> "$OUTDIR/${tag}_miniasm.log" || true
   done
 
   echo "[full] === contiguity (analyze_gfa.sh + compute_aun.py + N50) ==="

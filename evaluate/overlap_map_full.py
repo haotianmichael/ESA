@@ -2,18 +2,26 @@
 Neurosamble Phase 4 -- streaming IVF query + chaining -> neurosamble.paf.
 
 Replaces the Phase-2 in-memory pair-anchor dict (O(N^2) RAM) with a per-query-read
-streaming pass: memory is bounded by ONE read's anchors, not the whole N^2 pair
-set. The encoder is NOT loaded here -- query vectors come straight from the encode
-memmap shards.
+streaming pass: memory is bounded by ONE read's anchors. The encoder is NOT loaded
+here -- query vectors come straight from the encode memmap shards.
 
 For each query read R (windows are contiguous per read in the global row order):
   * fetch R's window vectors from its shard memmap, ``index.search(nprobe, topk)``,
   * keep neighbors whose target read T satisfies ``T != R`` AND
-    ``canonical(R,T)[0] == R`` (i.e. name(R) <= name(T)) -- self-excludes and dedups
-    (A,B)/(B,A) in one condition, halving work,
-  * group anchors by T -> ``chain_anchors`` per (R,T) -> append surviving chains to
-    the PAF (append mode; nothing accumulates across reads),
+    ``name(R) < name(T)`` -- self-excludes and dedups (A,B)/(B,A) in one condition,
+    halving work,  (implemented with a precomputed lexicographic rank per read),
+  * group anchors by T -> ``chain_anchors`` per (R,T) -> append surviving chains,
   * free R's anchor structures before the next read.
+
+The neighbor filtering is vectorized with numpy (critical: at high topk the
+per-neighbor Python loop is 28M*topk iterations and would dominate). Only the
+per-pair chaining stays in Python.
+
+topk MUST scale with coverage: each window has ~coverage true neighbors, so a
+fixed small topk caps recall at ~topk/coverage.
+
+FAISS on CPU by default; ``--faiss_gpu 1`` shards the index across all GPUs (exact
+IVFFlat search, fp16 storage) -- required for full-scale high-topk throughput.
 
 PAF format matches Phase 2: 12 std cols + ``mt:f:0.0`` tag on every line; qname/tname
 are real read-ids; coords in bp = offset_samples // samples_per_kmer.
@@ -34,7 +42,6 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 from overlap_chain import chain_anchors  # noqa: E402
-from overlap_probe import canonical_pair  # noqa: E402
 
 
 def parse_args():
@@ -51,22 +58,54 @@ def parse_args():
     p.add_argument("--max_gap_bp", type=int, default=2500)
     p.add_argument("--bw_bp", type=int, default=5000)
     p.add_argument("--faiss_gpu", type=int, default=0,
-                   help="1 = move index to GPU(s) for query (only sensible for ivfpq)")
+                   help="1 = shard index across all GPUs (exact IVFFlat, fp16)")
     return p.parse_args()
 
 
-def _load_read_table(path):
-    """read_ids.txt lines 'gid<TAB>name<TAB>nsamp' -> (id2name, id2nsamp) dicts."""
-    id2name, id2nsamp = {}, {}
+def load_read_table(path):
+    """read_ids.txt lines 'gid<TAB>name<TAB>nsamp' -> arrays indexed by gid.
+
+    Returns (id2name list, name_rank int64[max_gid+1], nsamp int64[max_gid+1]).
+    name_rank is the lexicographic rank of each read's name (names are unique, so
+    ranks are unique) -- the canonical R<T test becomes rank[R] < rank[T].
+    """
+    gids, names, nsamps = [], [], []
     with open(path) as f:
         for line in f:
             parts = line.rstrip("\n").split("\t")
             if len(parts) < 3:
                 continue
-            gid = int(parts[0])
-            id2name[gid] = parts[1]
-            id2nsamp[gid] = int(parts[2])
-    return id2name, id2nsamp
+            gids.append(int(parts[0]))
+            names.append(parts[1])
+            nsamps.append(int(parts[2]))
+    max_gid = max(gids)
+    id2name = [None] * (max_gid + 1)
+    nsamp = np.zeros(max_gid + 1, dtype=np.int64)
+    for g, nm, ns in zip(gids, names, nsamps):
+        id2name[g] = nm
+        nsamp[g] = ns
+    rank_of = {nm: i for i, nm in enumerate(sorted(names))}
+    name_rank = np.full(max_gid + 1, -1, dtype=np.int64)
+    for g, nm in zip(gids, names):
+        name_rank[g] = rank_of[nm]
+    return id2name, name_rank, nsamp
+
+
+def filter_neighbors(r_gid, r_rank, nid, sc, qoff, win_gid, win_off, name_rank):
+    """Vectorized keep of canonical cross-read neighbors for one query read.
+
+    nid/sc/qoff are flattened [nq*topk] neighbor row-ids / scores / query offsets.
+    Keeps rows where the neighbor is a real hit, a DIFFERENT read, and canonical
+    (name(R) < name(T)  <=>  rank[T] > r_rank). Returns (t_gid, t_off, qoff, sc).
+    """
+    valid = nid >= 0
+    nid = nid[valid]; sc = sc[valid]; qoff = qoff[valid]
+    if nid.size == 0:
+        z = np.empty(0, dtype=np.int64)
+        return z, z, z, np.empty(0, dtype=np.float32)
+    t_gid = win_gid[nid]
+    keep = (t_gid != r_gid) & (name_rank[t_gid] > r_rank)
+    return t_gid[keep], win_off[nid][keep], qoff[keep], sc[keep]
 
 
 def main():
@@ -96,20 +135,25 @@ def main():
     cum = np.asarray(cum)
 
     windows = np.load(os.path.join(args.index_dir, "windows.npy"))   # [N,2] (gid, off)
-    id2name, id2nsamp = _load_read_table(os.path.join(args.index_dir, "read_ids.txt"))
+    win_gid = np.ascontiguousarray(windows[:, 0])
+    win_off = np.ascontiguousarray(windows[:, 1])
+    id2name, name_rank, nsamp = load_read_table(os.path.join(args.index_dir, "read_ids.txt"))
     N = windows.shape[0]
 
     index = faiss.read_index(os.path.join(args.index_dir, "ivf.index"))
+    if args.faiss_gpu:
+        print("[map] sharding index across all GPUs (exact IVFFlat, fp16)", flush=True)
+        co = faiss.GpuMultipleClonerOptions()
+        co.shard = True
+        co.useFloat16 = True
+        index = faiss.index_cpu_to_all_gpus(index, co=co)
     try:
         index.nprobe = args.nprobe
     except Exception:
         faiss.ParameterSpace().set_index_parameter(index, "nprobe", args.nprobe)
-    if args.faiss_gpu:
-        print("[map] moving index to GPU(s) for query", flush=True)
-        index = faiss.index_cpu_to_all_gpus(index)
-    print(f"[map] N_windows={N} nprobe={args.nprobe} topk={args.topk} spk={spk} "
-          f"win_bp={win_bp} thresholds(mcs={args.min_chaining_score},mna={args.min_num_anchors},"
-          f"gap={args.max_gap_bp},bw={args.bw_bp})", flush=True)
+    print(f"[map] N_windows={N} nprobe={args.nprobe} topk={args.topk} spk={spk} win_bp={win_bp} "
+          f"gpu={args.faiss_gpu} thresholds(mcs={args.min_chaining_score},"
+          f"mna={args.min_num_anchors},gap={args.max_gap_bp},bw={args.bw_bp})", flush=True)
 
     def shard_rows(i, j):
         """Vectors for global rows [i, j) -- a single read is within one shard."""
@@ -117,58 +161,58 @@ def main():
         return np.ascontiguousarray(mmaps[s][i - cum[s]: j - cum[s]])
 
     # Per-read groups = maximal runs of equal gid in row order.
-    gids = windows[:, 0]
-    boundaries = np.flatnonzero(np.diff(gids)) + 1
+    boundaries = np.flatnonzero(np.diff(win_gid)) + 1
     starts = np.concatenate([[0], boundaries])
     ends = np.concatenate([boundaries, [N]])
 
     out = open(args.out_paf, "w")
-    n_reads = 0
-    n_pairs = 0
-    n_chains = 0
+    n_reads = n_pairs = n_chains = 0
     t0 = time.time()
 
     for i, j in zip(starts.tolist(), ends.tolist()):
-        r_gid = int(gids[i])
-        r_name = id2name.get(r_gid)
+        r_gid = int(win_gid[i])
+        r_name = id2name[r_gid]
         if r_name is None:
             continue
         n_reads += 1
+        r_rank = int(name_rank[r_gid])
         qvecs = shard_rows(i, j)
-        q_offs = windows[i:j, 1]
+        q_offs = win_off[i:j]
         scores, ids = index.search(qvecs, args.topk)
 
-        anchors_by_T = {}   # t_gid -> {(q_off, t_off): score}
-        for qr in range(qvecs.shape[0]):
-            q_off = int(q_offs[qr])
-            for score, nid in zip(scores[qr], ids[qr]):
-                if nid < 0:
-                    continue
-                t_gid = int(windows[nid, 0])
-                if t_gid == r_gid:
-                    continue
-                t_name = id2name.get(t_gid)
-                if t_name is None or r_name > t_name:   # keep only canonical R<=T
-                    continue
-                t_off = int(windows[nid, 1])
-                d = anchors_by_T.setdefault(t_gid, {})
-                key = (q_off, t_off)
-                sc = float(score)
-                if key not in d or sc > d[key]:
-                    d[key] = sc
+        nid = ids.reshape(-1)
+        sc = scores.reshape(-1)
+        qoff = np.repeat(q_offs, args.topk)
+        t_gid, t_off, q_kept, s_kept = filter_neighbors(
+            r_gid, r_rank, nid, sc, qoff, win_gid, win_off, name_rank)
 
-        if anchors_by_T:
-            qlen = max(1, id2nsamp.get(r_gid, spk) // spk)
-            for t_gid, anchors in anchors_by_T.items():
+        if t_gid.size:
+            # Group by target read, then chain each (R,T).
+            order = np.argsort(t_gid, kind="stable")
+            tg = t_gid[order]; to = t_off[order]; qo = q_kept[order]; ss = s_kept[order]
+            seg = np.flatnonzero(np.diff(tg)) + 1
+            seg_starts = np.concatenate([[0], seg])
+            seg_ends = np.concatenate([seg, [tg.size]])
+            qlen = max(1, int(nsamp[r_gid]) // spk)
+
+            for a, b in zip(seg_starts.tolist(), seg_ends.tolist()):
+                t = int(tg[a])
+                anchors = {}
+                qo_a = qo[a:b]; to_a = to[a:b]; ss_a = ss[a:b]
+                for k in range(b - a):
+                    key = (int(qo_a[k]), int(to_a[k]))
+                    v = float(ss_a[k])
+                    cur = anchors.get(key)
+                    if cur is None or v > cur:
+                        anchors[key] = v
                 chains = chain_anchors(
                     anchors, spk, args.min_num_anchors, args.min_chaining_score,
-                    max_gap_bp=args.max_gap_bp, bw_bp=args.bw_bp,
-                )
+                    max_gap_bp=args.max_gap_bp, bw_bp=args.bw_bp)
                 if not chains:
                     continue
-                t_name = id2name[t_gid]
-                tlen = max(1, id2nsamp.get(t_gid, spk) // spk)
-                wrote_pair = False
+                t_name = id2name[t]
+                tlen = max(1, int(nsamp[t]) // spk)
+                wrote = False
                 for ch in chains:
                     qs = max(0, min(ch.q_start, qlen)); qe = max(0, min(ch.q_end, qlen))
                     ts = max(0, min(ch.t_start, tlen)); te = max(0, min(ch.t_end, tlen))
@@ -179,11 +223,10 @@ def main():
                     cols = [r_name, qlen, qs, qe, "+", t_name, tlen, ts, te, span, span, mapq]
                     out.write("\t".join(str(c) for c in cols) + "\tmt:f:0.0\n")
                     n_chains += 1
-                    wrote_pair = True
-                if wrote_pair:
+                    wrote = True
+                if wrote:
                     n_pairs += 1
 
-        del anchors_by_T
         if (n_reads % 20000) == 0:
             dt = time.time() - t0
             print(f"[map] reads={n_reads} pairs={n_pairs} chains={n_chains} "
@@ -199,7 +242,7 @@ def main():
         "n_reads": n_reads, "n_windows": int(N),
         "n_pairs_reported": n_pairs, "n_chains": n_chains,
         "query_sec": round(query_sec, 1), "peak_rss_gb": round(peak_rss_gb, 2),
-        "nprobe": args.nprobe, "topk": args.topk,
+        "nprobe": args.nprobe, "topk": args.topk, "faiss_gpu": int(args.faiss_gpu),
     }
     with open(os.path.join(args.index_dir, "query_stats.json"), "w") as f:
         json.dump(stats, f, indent=2)
