@@ -44,13 +44,17 @@ MINIMAP2="${MINIMAP2:-minimap2}"
 PYTHON="${PYTHON:-python}"
 TORCHRUN="${TORCHRUN:-torchrun}"
 SPK="${SAMPLES_PER_KMER:-9}"
+# topk MUST scale with coverage for all-vs-all: each window has ~coverage true
+# neighbors, so a fixed small topk caps recall at ~topk/coverage. Configurable.
+TOPK="${TOPK:-10}"
+FAISS_GPU="${FAISS_GPU:-0}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # evaluate/
 mkdir -p "$OUTDIR" "$OUTDIR/encode" "$OUTDIR/index"
 NEURO_PAF="$OUTDIR/neurosamble.paf"
 RAW_PAF="$OUTDIR/rawsamble.paf"
 TRUTH_PAF="$OUTDIR/mm2_overlaps.paf"
-echo "[full] OUTDIR=$OUTDIR NUM_GPUS=$NUM_GPUS NPROBE=$NPROBE INDEX_TYPE=$INDEX_TYPE DO_ASSEMBLY=$DO_ASSEMBLY THREADS=$THREADS SPK=$SPK"
+echo "[full] OUTDIR=$OUTDIR NUM_GPUS=$NUM_GPUS NPROBE=$NPROBE TOPK=$TOPK INDEX_TYPE=$INDEX_TYPE FAISS_GPU=$FAISS_GPU DO_ASSEMBLY=$DO_ASSEMBLY THREADS=$THREADS SPK=$SPK"
 
 # --------------------------------------------------------------------------- #
 # 1) Neurosamble scale path: encode (2 GPU) -> IVF (CPU) -> streaming query
@@ -74,8 +78,8 @@ INDEX_SEC=$((SECONDS - T_IDX0))
 echo "[full] === streaming query + chaining ==="
 "$PYTHON" "$HERE/overlap_map_full.py" \
   --index_dir "$OUTDIR/index" --encode_dir "$OUTDIR/encode" \
-  --out_paf "$NEURO_PAF" --nprobe "$NPROBE" --topk 10 \
-  --threads "$THREADS" --samples_per_kmer "$SPK" \
+  --out_paf "$NEURO_PAF" --nprobe "$NPROBE" --topk "$TOPK" \
+  --threads "$THREADS" --samples_per_kmer "$SPK" --faiss_gpu "$FAISS_GPU" \
   2>&1 | tee "$OUTDIR/query.log"
 
 # --------------------------------------------------------------------------- #
