@@ -76,8 +76,22 @@ def test_sanitize_drops_selfhit_reversed_shortcols_and_missing(tmp_path):
         _paf_line("B", "A"),                        # good
     ]
     inp.write_text("".join(lines))
-    kept, dropped = sanitize(str(inp), str(outp), fasta_ids={"A", "B"})
+    # fasta lengths equal to the PAF qlen -> rescale is identity
+    kept, dropped = sanitize(str(inp), str(outp), fasta_lengths={"A": 1000, "B": 1000})
     assert kept == 2 and dropped == 4
     got = [ln.split("\t")[:6] for ln in outp.read_text().splitlines()]
     assert got[0][0] == "A" and got[0][5] == "B"
     assert got[1][0] == "B" and got[1][5] == "A"
+
+
+def test_sanitize_rescales_lengths_and_coords_to_fasta(tmp_path):
+    inp = tmp_path / "in.paf"
+    outp = tmp_path / "out.paf"
+    # PAF qlen/tlen = 2000 but the real basecalled read is 1000 bases -> halve.
+    inp.write_text(_paf_line("A", "B", qlen=2000, qs=100, qe=900,
+                             tlen=2000, ts=200, te=1000))
+    kept, dropped = sanitize(str(inp), str(outp), fasta_lengths={"A": 1000, "B": 1000})
+    assert kept == 1 and dropped == 0
+    f = outp.read_text().splitlines()[0].split("\t")
+    assert f[1] == "1000" and f[2] == "50" and f[3] == "450"     # q rescaled /2
+    assert f[6] == "1000" and f[7] == "100" and f[8] == "500"    # t rescaled /2
