@@ -35,6 +35,8 @@ if [[ $# -lt 8 ]]; then
 fi
 
 OUTDIR="$1"; REAL_BLOW5="$2"; READS_FASTA="$3"; REF="$4"
+# Derive phase tag from output dir name (e.g. neurosamble_phase5 -> phase5)
+PHASE_TAG="$(basename "$OUTDIR")"
 PORE="$5"; RAWHASH2_BIN="$6"; THREADS="$7"; SCRIPTS_DIR="$8"
 NUM_GPUS="${9:-2}"; NPROBE="${10:-64}"; INDEX_TYPE="${11:-ivfflat}"; DO_ASSEMBLY="${12:-1}"
 
@@ -168,16 +170,18 @@ if [[ "$DO_ASSEMBLY" != "0" ]]; then
 fi
 
 # --------------------------------------------------------------------------- #
-# 7) SUMMARY + phase4_summary.csv
+# 7) SUMMARY + ${PHASE_TAG}_summary.csv
 # --------------------------------------------------------------------------- #
+SUMMARY_CSV="${OUTDIR}/${PHASE_TAG}_summary.csv"
 echo "[full] === summary ==="
 "$PYTHON" "$HERE/overlap_full_summary.py" \
   --run_dir "$OUTDIR" --encode_sec "$ENCODE_SEC" --index_sec "$INDEX_SEC" \
+  --out_csv "$SUMMARY_CSV" \
   2>&1 | tee "$OUTDIR/summary.log"
 
 echo ""
-echo "############################ PHASE 4 SUMMARY ############################"
+echo "############################ ${PHASE_TAG^^} SUMMARY ############################"
 echo "OUTDIR=$OUTDIR  encode_sec=$ENCODE_SEC  index_sec=$INDEX_SEC"
-cat "$OUTDIR/phase4_summary.csv" 2>/dev/null || true
+cat "$SUMMARY_CSV" 2>/dev/null || true
 echo "########################################################################"
 echo "[full] DONE. Outputs under: $OUTDIR"
