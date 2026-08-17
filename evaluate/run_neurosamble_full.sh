@@ -46,6 +46,7 @@ MINIMAP2="${MINIMAP2:-minimap2}"
 PYTHON="${PYTHON:-python}"
 TORCHRUN="${TORCHRUN:-torchrun}"
 SPK="${SAMPLES_PER_KMER:-9}"
+RAWHASH_PRESET="${RAWHASH_PRESET:-}"   # set to "--r10" for R10.4.1 data (else R9 defaults)
 # topk MUST scale with coverage for all-vs-all: each window has ~coverage true
 # neighbors, so a fixed small topk caps recall at ~topk/coverage. Configurable.
 TOPK="${TOPK:-10}"
@@ -96,9 +97,9 @@ echo "[full] === Rawsamble (rawhash2 -x ava) ==="
 if [[ -s "$RAW_PAF" ]]; then
   echo "[full] reuse existing rawsamble.paf (topk-independent): $RAW_PAF"
 else
-  "$RAWHASH2_BIN" -x ava -t "$THREADS" -p "$PORE" -d "$OUTDIR/rawsamble_idx" "$REAL_BLOW5" \
+  "$RAWHASH2_BIN" -x ava $RAWHASH_PRESET -t "$THREADS" -p "$PORE" -d "$OUTDIR/rawsamble_idx" "$REAL_BLOW5" \
     2>&1 | tee "$OUTDIR/rawsamble_index.log"
-  "$RAWHASH2_BIN" -x ava -t "$THREADS" "$OUTDIR/rawsamble_idx" "$REAL_BLOW5" \
+  "$RAWHASH2_BIN" -x ava $RAWHASH_PRESET -t "$THREADS" "$OUTDIR/rawsamble_idx" "$REAL_BLOW5" \
     > "$RAW_PAF" 2> "$OUTDIR/rawsamble_map.log"
 fi
 
