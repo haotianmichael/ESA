@@ -59,6 +59,11 @@ def parse_args():
     p.add_argument("--bw_bp", type=int, default=5000)
     p.add_argument("--faiss_gpu", type=int, default=0,
                    help="1 = shard index across all GPUs (exact IVFFlat, fp16)")
+    p.add_argument("--query_batch", type=int, default=65536,
+                   help="max query rows per index.search call (chunks GPU temp mem)")
+    p.add_argument("--gpu_temp_mb", type=int, default=8192,
+                   help="FAISS GPU temp-memory pool per device (MB); must exceed a "
+                        "single search's temp alloc or search raises TemporaryMemoryOverflow")
     return p.parse_args()
 
 
@@ -108,6 +113,22 @@ def filter_neighbors(r_gid, r_rank, nid, sc, qoff, win_gid, win_off, name_rank):
     return t_gid[keep], win_off[nid][keep], qoff[keep], sc[keep]
 
 
+def batched_search(index, qvecs, topk, bs):
+    """index.search in sub-batches of <= bs rows, concatenated in order.
+
+    Bounds the FAISS GPU temporary allocation per call. Results are identical to a
+    single un-chunked search (row order preserved by concatenation).
+    """
+    if bs <= 0 or qvecs.shape[0] <= bs:
+        return index.search(qvecs, topk)
+    all_scores, all_ids = [], []
+    for i in range(0, qvecs.shape[0], bs):
+        s, d = index.search(qvecs[i:i + bs], topk)
+        all_scores.append(s)
+        all_ids.append(d)
+    return np.concatenate(all_scores, 0), np.concatenate(all_ids, 0)
+
+
 def main():
     args = parse_args()
     spk = max(1, int(args.samples_per_kmer))
@@ -147,19 +168,34 @@ def main():
         index.nprobe = args.nprobe
     except Exception:
         faiss.ParameterSpace().set_index_parameter(index, "nprobe", args.nprobe)
+    gpu_res = []  # kept alive for the index's lifetime (must outlive all searches)
     if args.faiss_gpu:
         print("[map] sharding index across all GPUs (exact IVFFlat, fp16)", flush=True)
         co = faiss.GpuMultipleClonerOptions()
         co.shard = True
         co.useFloat16 = True
-        index = faiss.index_cpu_to_all_gpus(index, co=co)
+        temp_bytes = int(args.gpu_temp_mb) * 1024 * 1024
+        try:
+            # Explicit per-GPU resources so we can raise the temp-memory pool above
+            # the (fixed, default ~1.5GB) ceiling that overflows at large nprobe/topk.
+            ngpu = faiss.get_num_gpus()
+            gpu_res = [faiss.StandardGpuResources() for _ in range(ngpu)]
+            for r in gpu_res:
+                r.setTempMemory(temp_bytes)
+            index = faiss.index_cpu_to_gpu_multiple_py(gpu_res, index, co)
+            print(f"[map] GPU temp mem = {args.gpu_temp_mb} MB x {ngpu} GPU(s)", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[map][warn] explicit GPU resources failed ({e}); "
+                  f"falling back to index_cpu_to_all_gpus (default temp mem)", flush=True)
+            index = faiss.index_cpu_to_all_gpus(index, co=co)
         # Best-effort: also set nprobe on the GPU shards (GPU has its own API).
         try:
             faiss.GpuParameterSpace().set_index_parameter(index, "nprobe", args.nprobe)
         except Exception:
             pass
     print(f"[map] N_windows={N} nprobe={args.nprobe} topk={args.topk} spk={spk} win_bp={win_bp} "
-          f"gpu={args.faiss_gpu} thresholds(mcs={args.min_chaining_score},"
+          f"gpu={args.faiss_gpu} query_batch={args.query_batch} gpu_temp_mb={args.gpu_temp_mb} "
+          f"thresholds(mcs={args.min_chaining_score},"
           f"mna={args.min_num_anchors},gap={args.max_gap_bp},bw={args.bw_bp})", flush=True)
 
     def shard_rows(i, j):
@@ -185,7 +221,7 @@ def main():
         r_rank = int(name_rank[r_gid])
         qvecs = shard_rows(i, j)
         q_offs = win_off[i:j]
-        scores, ids = index.search(qvecs, args.topk)
+        scores, ids = batched_search(index, qvecs, args.topk, args.query_batch)
 
         nid = ids.reshape(-1)
         sc = scores.reshape(-1)

@@ -87,6 +87,7 @@ else
     --index_dir "$OUTDIR/index" --encode_dir "$OUTDIR/encode" \
     --out_paf "$NEURO_PAF" --nprobe "$NPROBE" --topk "$TOPK" \
     --threads "$THREADS" --samples_per_kmer "$SPK" --faiss_gpu "$FAISS_GPU" \
+    --query_batch "${QUERY_BATCH:-65536}" --gpu_temp_mb "${GPU_TEMP_MB:-8192}" \
     2>&1 | tee "$OUTDIR/query.log"
 fi
 
