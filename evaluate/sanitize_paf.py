@@ -6,15 +6,18 @@ Two failure modes are handled:
 1. Degenerate/malformed lines -- self-hits (qname==tname), zero-length or reversed
    intervals, <12 cols, non-numeric coords, or a strand that is not +/-.
 
-2. Length inconsistency with the reads FASTA. miniasm (`-f reads.fasta`) treats the
-   FASTA sequence length as authoritative and SIGABRTs when a PAF read's length /
-   coordinates disagree with it. Signal-derived overlappers (Neurosamble uses
-   ``signal_len // samples_per_kmer``; rawhash2 estimates bases from signal) emit
-   qlen/tlen that differ from the basecalled read length -- which is exactly why
-   both tools' .gfa came out empty while minimap2's (lengths straight from the
-   FASTA) assembled fine. When ``--reads_fasta`` is given we therefore REWRITE each
-   line's qlen/tlen to the FASTA base length and rescale the coordinates
-   proportionally into that base space, so the PAF is fully consistent with ``-f``.
+2. Scale mismatch with the basecalled reads. Signal-domain overlappers report read
+   lengths in a signal-derived unit (Neurosamble: ``signal_len // samples_per_kmer``
+   ~= 1.28x bases; rawhash2: its own per-read base estimate), so their coordinates
+   sit on a stretched scale vs the basecalled genome length. When ``--reads_fasta``
+   is given we rescale by a SINGLE GLOBAL constant
+   ``c = median(fasta_len[r] / native_len[r])`` over reads shared by the PAF and the
+   FASTA. Multiplying every qlen/qs/qe/tlen/ts/te by the same ``c`` is a similarity
+   transform: it preserves the overlap geometry EXACTLY (so miniasm's graph topology
+   is unchanged) and only shifts the overall scale back into base space. This
+   replaces the earlier PER-READ rescale, which set qlen=fasta_len line-by-line and
+   -- because rawhash2's length/base ratio varies read-to-read -- distorted the
+   geometry and shattered assemblies.
 
 This only affects the assembly input (the ``*.clean.paf``); the overlap P/R/F1 is
 scored on the original PAF, so those numbers are untouched.
@@ -25,6 +28,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import statistics
 
 
 def read_fasta_lengths(path):
@@ -46,24 +50,47 @@ def read_fasta_lengths(path):
     return lengths
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Sanitize an overlap PAF for miniasm")
-    p.add_argument("--in_paf", required=True)
-    p.add_argument("--out_paf", required=True)
-    p.add_argument("--reads_fasta", default=None,
-                   help="rewrite qlen/tlen to FASTA base lengths + rescale coords "
-                        "(and drop reads absent from the FASTA)")
-    return p.parse_args()
+def read_native_lengths(in_paf):
+    """read -> native PAF length (qlen when it is the query, tlen when target)."""
+    native = {}
+    with open(in_paf) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            c = line.rstrip("\n").split("\t")
+            if len(c) < 9:
+                continue
+            try:
+                ql, tl = int(c[1]), int(c[6])
+            except ValueError:
+                continue
+            q, t = c[0], c[5]
+            if ql > native.get(q, 0):
+                native[q] = ql
+            if tl > native.get(t, 0):
+                native[t] = tl
+    return native
 
 
-def _rescale(x, paf_len, fasta_len):
-    if paf_len <= 0:
-        return 0
-    v = int(round(x * fasta_len / paf_len))
-    return max(0, min(v, fasta_len))
+def global_scale(native_lengths, fasta_lengths):
+    """Single global c = median(fasta_len[r] / native_len[r]) over shared reads."""
+    ratios = [fasta_lengths[r] / nl
+              for r, nl in native_lengths.items()
+              if nl > 0 and r in fasta_lengths]
+    if not ratios:
+        return 1.0, 0
+    return float(statistics.median(ratios)), len(ratios)
 
 
 def sanitize(in_paf, out_paf, fasta_lengths=None):
+    """Filter degenerate lines; if fasta_lengths given, apply one GLOBAL scale c."""
+    scale = None
+    if fasta_lengths is not None:
+        native = read_native_lengths(in_paf)
+        scale, n_used = global_scale(native, fasta_lengths)
+        print(f"[sanitize] global scale c={scale:.6f} (median over {n_used} shared reads)",
+              flush=True)
+
     kept = dropped = 0
     with open(in_paf) as fin, open(out_paf, "w") as fout:
         for line in fin:
@@ -84,15 +111,11 @@ def sanitize(in_paf, out_paf, fasta_lengths=None):
                 dropped += 1
                 continue
 
-            if fasta_lengths is not None:
-                fq = fasta_lengths.get(qname)
-                ft = fasta_lengths.get(tname)
-                if fq is None or ft is None or qlen <= 0 or tlen <= 0:
-                    dropped += 1
-                    continue
-                qs, qe = _rescale(qs, qlen, fq), _rescale(qe, qlen, fq)
-                ts, te = _rescale(ts, tlen, ft), _rescale(te, tlen, ft)
-                qlen, tlen = fq, ft
+            if scale is not None:
+                # Similarity transform: same constant on every coordinate/length so
+                # the overlap geometry is preserved. Never set qlen = fasta_len.
+                qlen, qs, qe = round(qlen * scale), round(qs * scale), round(qe * scale)
+                tlen, ts, te = round(tlen * scale), round(ts * scale), round(te * scale)
                 f[1], f[2], f[3] = str(qlen), str(qs), str(qe)
                 f[6], f[7], f[8] = str(tlen), str(ts), str(te)
 
@@ -104,12 +127,22 @@ def sanitize(in_paf, out_paf, fasta_lengths=None):
     return kept, dropped
 
 
+def parse_args():
+    p = argparse.ArgumentParser(description="Sanitize an overlap PAF for miniasm")
+    p.add_argument("--in_paf", required=True)
+    p.add_argument("--out_paf", required=True)
+    p.add_argument("--reads_fasta", default=None,
+                   help="apply a single GLOBAL scale c=median(fasta_len/native_len) to "
+                        "all coords (similarity transform; preserves overlap geometry)")
+    return p.parse_args()
+
+
 def main():
     args = parse_args()
     fasta_lengths = read_fasta_lengths(args.reads_fasta) if args.reads_fasta else None
     kept, dropped = sanitize(args.in_paf, args.out_paf, fasta_lengths)
     print(f"[sanitize] {args.in_paf}: kept={kept} dropped={dropped} -> {args.out_paf}"
-          + (" (lengths/coords rescaled to FASTA)" if fasta_lengths else ""), flush=True)
+          + (" (globally rescaled to base space)" if fasta_lengths else ""), flush=True)
 
 
 if __name__ == "__main__":

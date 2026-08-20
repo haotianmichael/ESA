@@ -132,14 +132,13 @@ if [[ "$DO_ASSEMBLY" != "0" ]]; then
   # 5) Assembly + contiguity
   # ------------------------------------------------------------------------- #
   echo "[full] === miniasm assembly ==="
-  # FAIRNESS: assemble every tool on its OWN native coordinates. mm2's PAF is
-  # already in base space (rescale is identity), so it keeps --reads_fasta + -f to
-  # emit contig sequences. The signal-domain tools (neurosamble, rawsamble) must
-  # NOT be rescaled to the basecalled reads.fasta: rawhash2's per-read
-  # length/base ratio varies read-to-read, so proportional rescaling distorts the
-  # overlap geometry and shatters the assembly (Rawsamble -> ~79kb instead of
-  # ~1.5Mb). They sanitize WITHOUT --reads_fasta (dedup/degenerate filter only)
-  # and assemble on native PAF coords (no -f; lengths come from the PAF).
+  # FAIRNESS: every tool sanitizes with --reads_fasta, which now applies ONE global
+  # scale c=median(fasta_len/native_len) -- a similarity transform that preserves
+  # each tool's overlap geometry (topology unchanged) and only shifts the overall
+  # scale into base space. Per-tool c differs (mm2 ~1.0 identity; Neurosamble ~0.78;
+  # rawsamble its own), so none is stretched relative to its own reads. mm2 also
+  # gets miniasm -f reads.fasta (real contig sequences); the signal-domain tools
+  # assemble without -f (lengths from the rescaled PAF).
   for tag in neurosamble rawsamble mm2; do
     case "$tag" in
       neurosamble) PAF="$NEURO_PAF" ;;
@@ -155,8 +154,11 @@ if [[ "$DO_ASSEMBLY" != "0" ]]; then
       "$MINIASM" -f "$READS_FASTA" "$CLEAN" \
         > "$GFA" 2> "$OUTDIR/${tag}_miniasm.log" || true
     else
+      # Global-scale sanitize (single median constant c; preserves overlap geometry,
+      # only shifts scale into base space). Assemble on the rescaled native coords
+      # without -f (lengths come from the rescaled PAF).
       "$PYTHON" "$HERE/sanitize_paf.py" --in_paf "$PAF" \
-        --out_paf "$CLEAN" \
+        --out_paf "$CLEAN" --reads_fasta "$READS_FASTA" \
         2>&1 | tee -a "$OUTDIR/sanitize.log"
       "$MINIASM" "$CLEAN" > "$GFA" 2> "$OUTDIR/${tag}_miniasm.log" || true
       if [[ ! -s "$GFA" ]]; then

@@ -76,22 +76,43 @@ def test_sanitize_drops_selfhit_reversed_shortcols_and_missing(tmp_path):
         _paf_line("B", "A"),                        # good
     ]
     inp.write_text("".join(lines))
-    # fasta lengths equal to the PAF qlen -> rescale is identity
+    # fasta lengths equal to the PAF qlen -> global scale c = 1.0 (identity).
+    # Global mode does NOT drop reads absent from the FASTA, so the A->Z line stays.
     kept, dropped = sanitize(str(inp), str(outp), fasta_lengths={"A": 1000, "B": 1000})
-    assert kept == 2 and dropped == 4
+    assert kept == 3 and dropped == 3          # self-hit, reversed, <12-cols dropped
     got = [ln.split("\t")[:6] for ln in outp.read_text().splitlines()]
     assert got[0][0] == "A" and got[0][5] == "B"
-    assert got[1][0] == "B" and got[1][5] == "A"
+    assert got[1][0] == "A" and got[1][5] == "Z"
+    assert got[2][0] == "B" and got[2][5] == "A"
 
 
-def test_sanitize_rescales_lengths_and_coords_to_fasta(tmp_path):
+def test_sanitize_global_scale_halves_all_coords(tmp_path):
     inp = tmp_path / "in.paf"
     outp = tmp_path / "out.paf"
-    # PAF qlen/tlen = 2000 but the real basecalled read is 1000 bases -> halve.
+    # Native qlen/tlen = 2000, basecalled read = 1000 bases -> c = median(0.5,0.5) = 0.5.
     inp.write_text(_paf_line("A", "B", qlen=2000, qs=100, qe=900,
                              tlen=2000, ts=200, te=1000))
     kept, dropped = sanitize(str(inp), str(outp), fasta_lengths={"A": 1000, "B": 1000})
     assert kept == 1 and dropped == 0
     f = outp.read_text().splitlines()[0].split("\t")
-    assert f[1] == "1000" and f[2] == "50" and f[3] == "450"     # q rescaled /2
-    assert f[6] == "1000" and f[7] == "100" and f[8] == "500"    # t rescaled /2
+    assert f[1] == "1000" and f[2] == "50" and f[3] == "450"     # q scaled x0.5
+    assert f[6] == "1000" and f[7] == "100" and f[8] == "500"    # t scaled x0.5
+
+
+def test_sanitize_uses_median_ratio_not_perline(tmp_path):
+    # Two reads with DIFFERENT length ratios; a single global c = median is applied
+    # to every line (not each read's own ratio). native A=1000, B=2000, C=1000;
+    # fasta A=800 (0.8), B=1000 (0.5), C=900 (0.9) -> median(0.8,0.5,0.9)=0.8.
+    inp = tmp_path / "in.paf"
+    outp = tmp_path / "out.paf"
+    inp.write_text(
+        _paf_line("A", "B", qlen=1000, qs=0, qe=1000, tlen=2000, ts=0, te=2000)
+        + _paf_line("C", "B", qlen=1000, qs=0, qe=1000, tlen=2000, ts=0, te=2000)
+    )
+    kept, dropped = sanitize(str(inp), str(outp),
+                             fasta_lengths={"A": 800, "B": 1000, "C": 900})
+    assert kept == 2
+    f = outp.read_text().splitlines()[0].split("\t")
+    # global c = 0.8 applied to BOTH q(1000->800) and t(2000->1600), not per-read
+    assert f[1] == "800" and f[3] == "800"
+    assert f[6] == "1600" and f[8] == "1600"
