@@ -132,19 +132,65 @@ if [[ "$DO_ASSEMBLY" != "0" ]]; then
   # 5) Assembly + contiguity
   # ------------------------------------------------------------------------- #
   echo "[full] === miniasm assembly ==="
+  # FAIRNESS: assemble every tool on its OWN native coordinates. mm2's PAF is
+  # already in base space (rescale is identity), so it keeps --reads_fasta + -f to
+  # emit contig sequences. The signal-domain tools (neurosamble, rawsamble) must
+  # NOT be rescaled to the basecalled reads.fasta: rawhash2's per-read
+  # length/base ratio varies read-to-read, so proportional rescaling distorts the
+  # overlap geometry and shatters the assembly (Rawsamble -> ~79kb instead of
+  # ~1.5Mb). They sanitize WITHOUT --reads_fasta (dedup/degenerate filter only)
+  # and assemble on native PAF coords (no -f; lengths come from the PAF).
   for tag in neurosamble rawsamble mm2; do
     case "$tag" in
       neurosamble) PAF="$NEURO_PAF" ;;
       rawsamble)   PAF="$RAW_PAF" ;;
       mm2)         PAF="$TRUTH_PAF" ;;
     esac
-    # Sanitize first: miniasm SIGABRTs on self-hits / degenerate coords / reads
-    # missing from the FASTA (this is why rawsamble.gfa kept coming out empty).
-    "$PYTHON" "$HERE/sanitize_paf.py" --in_paf "$PAF" \
-      --out_paf "$OUTDIR/${tag}.clean.paf" --reads_fasta "$READS_FASTA" \
-      2>&1 | tee -a "$OUTDIR/sanitize.log"
-    "$MINIASM" -f "$READS_FASTA" "$OUTDIR/${tag}.clean.paf" \
-      > "$OUTDIR/${tag}.gfa" 2> "$OUTDIR/${tag}_miniasm.log" || true
+    CLEAN="$OUTDIR/${tag}.clean.paf"
+    GFA="$OUTDIR/${tag}.gfa"
+    if [[ "$tag" == "mm2" ]]; then
+      "$PYTHON" "$HERE/sanitize_paf.py" --in_paf "$PAF" \
+        --out_paf "$CLEAN" --reads_fasta "$READS_FASTA" \
+        2>&1 | tee -a "$OUTDIR/sanitize.log"
+      "$MINIASM" -f "$READS_FASTA" "$CLEAN" \
+        > "$GFA" 2> "$OUTDIR/${tag}_miniasm.log" || true
+    else
+      "$PYTHON" "$HERE/sanitize_paf.py" --in_paf "$PAF" \
+        --out_paf "$CLEAN" \
+        2>&1 | tee -a "$OUTDIR/sanitize.log"
+      "$MINIASM" "$CLEAN" > "$GFA" 2> "$OUTDIR/${tag}_miniasm.log" || true
+      if [[ ! -s "$GFA" ]]; then
+        # Fallback: some miniasm builds need -f. Build a placeholder FASTA from the
+        # NATIVE clean.paf read lengths (N x length) -- never the basecalled
+        # reads.fasta, so no rescaling of the signal-domain coordinates.
+        echo "[full] $tag: miniasm w/o -f gave empty gfa; retrying with placeholder FASTA" \
+          | tee -a "$OUTDIR/${tag}_miniasm.log"
+        PLACE="$OUTDIR/${tag}.placeholder.fasta"
+        "$PYTHON" -c '
+import sys
+clean, out = sys.argv[1], sys.argv[2]
+L = {}
+with open(clean) as f:
+    for line in f:
+        c = line.rstrip("\n").split("\t")
+        if len(c) < 9:
+            continue
+        try:
+            ql, tl = int(c[1]), int(c[6])
+        except ValueError:
+            continue
+        if ql > L.get(c[0], 0):
+            L[c[0]] = ql
+        if tl > L.get(c[5], 0):
+            L[c[5]] = tl
+with open(out, "w") as w:
+    for name, n in L.items():
+        w.write(">" + name + "\n" + "N" * n + "\n")
+' "$CLEAN" "$PLACE" 2>&1 | tee -a "$OUTDIR/${tag}_miniasm.log" || true
+        "$MINIASM" -f "$PLACE" "$CLEAN" \
+          > "$GFA" 2> "$OUTDIR/${tag}_miniasm.log" || true
+      fi
+    fi
   done
 
   echo "[full] === contiguity (analyze_gfa.sh + compute_aun.py + N50) ==="
