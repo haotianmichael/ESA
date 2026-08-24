@@ -325,16 +325,30 @@ def source_pair_counts_paf(path):
     return counts
 
 
-def source_pair_counts_precand(path):
-    """dict canonical_pair -> n_anchors, from the precandidates TSV(.gz)."""
+def source_pair_counts_precand(path, min_anchors=1):
+    """dict canonical_pair -> n_anchors from the precandidates TSV(.gz).
+
+    Stream-filters to pairs with n_anchors >= min_anchors. The pre-chain set can be
+    billions of pairs (mostly 1-anchor noise), so keeping only the chainable floor
+    (e.g. >= min_num_anchors=5) bounds memory and is the meaningful purity level.
+    """
     counts = {}
+    kept = seen = 0
     with _open(path) as f:
-        header = f.readline()  # read_a read_b n_anchors
+        _ = f.readline()  # header: read_a read_b n_anchors
         for line in f:
             c = line.rstrip("\n").split("\t")
             if len(c) < 3:
                 continue
-            counts[canonical(c[0], c[1])] = int(c[2])
+            seen += 1
+            na = int(c[2])
+            if na < min_anchors:
+                continue
+            counts[canonical(c[0], c[1])] = na
+            kept += 1
+            if seen % 50_000_000 == 0:
+                info(f"  precand: scanned {seen} lines, kept {kept} (>= {min_anchors} anchors) ...")
+    info(f"  precand: kept {kept} / {seen} pairs at >= {min_anchors} anchors")
     return counts
 
 
@@ -368,7 +382,7 @@ def cmd_compare(args):
 
     # (i) Neurosamble PRE-chain candidates
     info("evaluating Neurosamble pre-chain candidates ...")
-    pc = source_pair_counts_precand(args.neuro_precand)
+    pc = source_pair_counts_precand(args.neuro_precand, args.precand_min_anchors)
     results["sources"].append(
         eval_vs_truth("neurosamble_precandidates", pc, truth, "anchors_per_pair"))
     del pc
@@ -472,6 +486,9 @@ def parse_args():
     c.add_argument("--neuro-paf", required=True, help="phase4 neurosamble.paf (final)")
     c.add_argument("--rawsamble-paf", required=True, help="phase4 rawsamble.paf (final)")
     c.add_argument("--truth", required=True, help="phase4 mm2_overlaps.paf (ava truth)")
+    c.add_argument("--precand-min-anchors", type=int, default=5,
+                   help="keep only pre-chain pairs with >= this many anchors (default 5 = "
+                        "the chainable floor; the full 1-anchor set is billions of pairs)")
     c.set_defaults(func=cmd_compare)
 
     r = sub.add_parser("rawsamble-loose-proxy",
