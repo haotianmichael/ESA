@@ -87,15 +87,16 @@ def parse_ref_paf(path):
     return aligns
 
 
-def parse_neuro_partners(path):
-    """read_id -> set(partner read_ids), unioning BOTH PAF columns (canonical input).
+def parse_graph_partners(path, label="graph"):
+    """read_id -> set(partner read_ids), from ANY overlap PAF (Neurosamble/Rawsamble).
 
-    neurosamble.paf is de-duped & canonical (qname < tname), so each pair appears
-    once; to recover a read's full neighbor set we must add the partner from
-    whichever column the read is NOT in -- i.e. union over col1 and col6.
+    Generic: unions BOTH col1 (qname) and col6 (tname) into a per-read set. Works
+    whether the input is canonical/de-duped (each pair once) or non-canonical / has
+    both (A,B) and (B,A) -- the set membership dedups either way. Streamed line by
+    line (never loaded whole into pandas).
     """
     if not os.path.exists(path):
-        die(f"--neuro_paf not found: {path}")
+        die(f"--graph_paf not found: {path}")
     partners = {}
     n_lines = 0
     with open(path) as f:
@@ -113,7 +114,7 @@ def parse_neuro_partners(path):
             n_lines += 1
     if not partners:
         die(f"no overlap pairs parsed from {path}")
-    info(f"neuro_paf: {n_lines} overlap records -> {len(partners)} reads with >=1 partner")
+    info(f"{label} graph_paf: {n_lines} overlap records -> {len(partners)} reads with >=1 partner")
     return partners
 
 
@@ -141,9 +142,15 @@ def count_loci(points, gap):
 # --------------------------------------------------------------------------- #
 def parse_args():
     p = argparse.ArgumentParser(description="Phase 7 repeat/multi-locus probe (offline)")
-    p.add_argument("--neuro_paf", required=True, help="Phase-4 neurosamble.paf (canonical ava)")
-    p.add_argument("--ref_paf", required=True, help="reads->REF PAF WITH secondaries (from run_phase7.sh)")
+    # --graph_paf is the generic overlap graph (Neurosamble OR Rawsamble); --neuro_paf
+    # is kept as a backward-compat alias (same dest).
+    p.add_argument("--graph_paf", "--neuro_paf", dest="graph_paf", required=True,
+                   help="overlap-graph PAF (Neurosamble or Rawsamble; canonical or not)")
+    p.add_argument("--ref_paf", required=True, help="reads->REF PAF WITH secondaries")
     p.add_argument("--out_dir", required=True)
+    p.add_argument("--graph_label", default="neurosamble",
+                   help="which graph produced --graph_paf (e.g. neurosamble / rawsamble)")
+    p.add_argument("--dataset", default="ecoli", help="dataset tag (e.g. ecoli / yeast)")
     p.add_argument("--locus_gap", type=int, default=20000,
                    help="single-linkage gap (bp) to merge alignment midpoints into one locus")
     p.add_argument("--mapq_thr", type=int, default=5,
@@ -158,42 +165,45 @@ def main():
     # ---- A) ground truth from reads->REF alignments --------------------------
     ref_aligns = parse_ref_paf(args.ref_paf)
 
-    # read_id -> (n_loci, is_repeat, primary_ref, primary_mid, primary_mapq, is_repeat_mapq)
+    # n_loci  = #distinct genomic loci (gap-clustered) -> interspersed/multi-locus repeats.
+    # n_aln   = total alignment records (primary+secondary) -> catches BOTH interspersed
+    #           AND tandem repeats (e.g. rDNA array), which n_loci can miss.
     mult = {}
     for rid, al in ref_aligns.items():
         pts = [(a["ref_name"], a["ref_mid"]) for a in al]
         n_loci = count_loci(pts, args.locus_gap)
+        n_aln = len(al)
         # primary = the tp:A:P alignment (highest mapq if several / none tagged P)
         prims = [a for a in al if a["tp"] == "P"]
         best = max(prims or al, key=lambda a: a["mapq"])
-        is_repeat = int(n_loci >= 2)
-        is_repeat_mapq = int(best["mapq"] < args.mapq_thr)
         mult[rid] = {
-            "n_loci": n_loci, "is_repeat": is_repeat,
+            "n_loci": n_loci, "is_repeat": int(n_loci >= 2),
+            "n_aln": n_aln, "is_multi": int(n_aln >= 2),
             "primary_ref": best["ref_name"], "primary_mid": best["ref_mid"],
-            "mapq": best["mapq"], "is_repeat_mapq": is_repeat_mapq,
+            "mapq": best["mapq"], "is_repeat_mapq": int(best["mapq"] < args.mapq_thr),
         }
 
     with open(os.path.join(args.out_dir, "read_multiplicity.tsv"), "w") as f:
-        f.write("read_id\tn_loci\tis_repeat\tprimary_ref\tprimary_mid\tmapq\tis_repeat_mapq\n")
+        f.write("read_id\tn_loci\tis_repeat\tn_aln\tis_multi\tprimary_ref\tprimary_mid\t"
+                "mapq\tis_repeat_mapq\n")
         for rid, m in mult.items():
-            f.write(f"{rid}\t{m['n_loci']}\t{m['is_repeat']}\t{m['primary_ref']}\t"
-                    f"{m['primary_mid']}\t{m['mapq']}\t{m['is_repeat_mapq']}\n")
+            f.write(f"{rid}\t{m['n_loci']}\t{m['is_repeat']}\t{m['n_aln']}\t{m['is_multi']}\t"
+                    f"{m['primary_ref']}\t{m['primary_mid']}\t{m['mapq']}\t{m['is_repeat_mapq']}\n")
 
-    # ---- B) partner sets from neuro.paf (both columns) ------------------------
-    partners = parse_neuro_partners(args.neuro_paf)
+    # ---- B) partner sets from the overlap graph (both columns) ----------------
+    partners = parse_graph_partners(args.graph_paf, args.graph_label)
 
     # ---- read-id consistency check (fail loudly on large mismatch) -----------
     ref_ids = set(ref_aligns.keys())
     paf_ids = set(partners.keys())
     inter = ref_ids & paf_ids
     frac = len(inter) / max(1, len(paf_ids))
-    info(f"read-id overlap: neuro_paf reads={len(paf_ids)} ref-aligned reads={len(ref_ids)} "
-         f"intersection={len(inter)} ({100*frac:.1f}% of neuro reads have a ref alignment)")
+    info(f"read-id overlap: graph reads={len(paf_ids)} ref-aligned reads={len(ref_ids)} "
+         f"intersection={len(inter)} ({100*frac:.1f}% of graph reads have a ref alignment)")
     if frac < 0.30:
-        die(f"only {100*frac:.1f}% of neuro_paf reads have a reads->REF alignment -- read-ids "
-            f"likely mismatch between neurosamble.paf and reads_to_ref.paf. Refusing to produce "
-            f"an empty/garbage join.")
+        die(f"only {100*frac:.1f}% of graph_paf reads have a reads->REF alignment -- read-ids "
+            f"likely mismatch between {args.graph_label} graph and reads_to_ref.paf. Refusing to "
+            f"produce an empty/garbage join.")
 
     # primary (ref_name, mid) lookup for dispersion
     primary = {rid: (m["primary_ref"], m["primary_mid"]) for rid, m in mult.items()}
@@ -222,14 +232,17 @@ def main():
             "n_loci": m["n_loci"] if m else -1,
             "is_repeat": m["is_repeat"] if m else -1,
             "is_repeat_mapq": m["is_repeat_mapq"] if m else -1,
+            "n_aln": m["n_aln"] if m else -1,
+            "is_multi": m["is_multi"] if m else -1,
         }
     info(f"partners without a primary ref alignment dropped: {dropped_total}")
 
     with open(os.path.join(args.out_dir, "read_features.tsv"), "w") as f:
-        f.write("read_id\tdegree\tpartner_locus_dispersion\tn_loci\tis_repeat\tis_repeat_mapq\n")
+        f.write("read_id\tdegree\tpartner_locus_dispersion\tn_loci\tis_repeat\t"
+                "is_repeat_mapq\tn_aln\tis_multi\n")
         for rid, ft in features.items():
             f.write(f"{rid}\t{ft['degree']}\t{ft['partner_locus_dispersion']}\t{ft['n_loci']}\t"
-                    f"{ft['is_repeat']}\t{ft['is_repeat_mapq']}\n")
+                    f"{ft['is_repeat']}\t{ft['is_repeat_mapq']}\t{ft['n_aln']}\t{ft['is_multi']}\n")
 
     # ---- D) evaluation on reads WITH a primary ref alignment ------------------
     import numpy as np
@@ -244,75 +257,88 @@ def main():
     nloci = np.array([e["n_loci"] for e in ev], dtype=float)
     y_loci = np.array([e["is_repeat"] for e in ev], dtype=int)
     y_mapq = np.array([e["is_repeat_mapq"] for e in ev], dtype=int)
+    y_multi = np.array([e["is_multi"] for e in ev], dtype=int)
 
     def safe_auc(fn, y, s):
         # AUC needs both classes present
         return float(fn(y, s)) if (y.min() == 0 and y.max() == 1) else float("nan")
 
+    # full {label x predictor} grid: 3 labels x {dispersion, degree}
+    label_defs = [
+        ("is_repeat_nloci", "n_loci>=2", y_loci),
+        ("is_repeat_mapq", "mapq<thr", y_mapq),
+        ("is_multi_naln", "n_aln>=2", y_multi),
+    ]
+    predictors = {"dispersion": disp, "degree": deg}
+    labels_grid = {}
+    for lname, desc, y in label_defs:
+        entry = {"desc": desc, "n_positive": int(y.sum()),
+                 "positive_frac": float(y.mean()) if len(y) else 0.0}
+        for pname, score in predictors.items():
+            entry[f"{pname}_roc_auc"] = safe_auc(roc_auc_score, y, score)
+            entry[f"{pname}_pr_auc"] = safe_auc(average_precision_score, y, score)
+        labels_grid[lname] = entry
+
+    # pairwise label agreement (robustness across repeat definitions)
+    def agreement(y1, y2):
+        n = len(y1)
+        both1 = int(np.sum((y1 == 1) & (y2 == 1)))
+        both0 = int(np.sum((y1 == 0) & (y2 == 0)))
+        union_pos = int(np.sum((y1 == 1) | (y2 == 1)))
+        jacc = both1 / union_pos if union_pos else float("nan")
+        return {"agreement_frac": (both1 + both0) / n if n else float("nan"),
+                "both_positive": both1, "both_negative": both0,
+                "positive_jaccard": jacc,
+                "flag": ("LOW positive overlap -- labels capture different repeat notions; "
+                         "treat AUC cautiously" if (jacc == jacc and jacc < 0.5)
+                         else "labels broadly consistent")}
+    ys = {n: y for n, _, y in label_defs}
+    pairwise = {}
+    names = list(ys)
+    for a in range(len(names)):
+        for b in range(a + 1, len(names)):
+            pairwise[f"{names[a]}__vs__{names[b]}"] = agreement(ys[names[a]], ys[names[b]])
+
     metrics = {
+        "graph_label": args.graph_label,
+        "dataset": args.dataset,
+        "graph_paf": os.path.abspath(args.graph_paf),
+        "ref_paf": os.path.abspath(args.ref_paf),
         "params": {"locus_gap": args.locus_gap, "mapq_thr": args.mapq_thr},
-        "n_reads_neuro": len(partners),
+        "n_reads_graph": len(partners),
         "n_reads_ref_aligned": len(ref_aligns),
         "n_reads_evaluated": len(ev),
         "n_dropped_partners": dropped_total,
-        "label_is_repeat(n_loci>=2)": {
-            "n_positive": int(y_loci.sum()),
-            "dispersion_roc_auc": safe_auc(roc_auc_score, y_loci, disp),
-            "dispersion_pr_auc": safe_auc(average_precision_score, y_loci, disp),
-            "degree_roc_auc": safe_auc(roc_auc_score, y_loci, deg),
-            "degree_pr_auc": safe_auc(average_precision_score, y_loci, deg),
-        },
-        "label_is_repeat_mapq(mapq<thr)": {
-            "n_positive": int(y_mapq.sum()),
-            "dispersion_roc_auc": safe_auc(roc_auc_score, y_mapq, disp),
-            "dispersion_pr_auc": safe_auc(average_precision_score, y_mapq, disp),
-            "degree_roc_auc": safe_auc(roc_auc_score, y_mapq, deg),
-            "degree_pr_auc": safe_auc(average_precision_score, y_mapq, deg),
-        },
+        "labels": labels_grid,
         "spearman_dispersion_vs_nloci": {
             "rho": float(spearmanr(disp, nloci).correlation),
             "p": float(spearmanr(disp, nloci).pvalue),
         },
-    }
-
-    # label agreement (robustness): confusion + overlap %
-    both1 = int(np.sum((y_loci == 1) & (y_mapq == 1)))
-    both0 = int(np.sum((y_loci == 0) & (y_mapq == 0)))
-    only_loci = int(np.sum((y_loci == 1) & (y_mapq == 0)))
-    only_mapq = int(np.sum((y_loci == 0) & (y_mapq == 1)))
-    agree = (both1 + both0) / len(ev)
-    # Jaccard over the positive sets
-    union_pos = int(np.sum((y_loci == 1) | (y_mapq == 1)))
-    jacc = both1 / union_pos if union_pos else float("nan")
-    metrics["label_agreement"] = {
-        "confusion": {"both_repeat": both1, "both_unique": both0,
-                      "only_nloci_repeat": only_loci, "only_mapq_repeat": only_mapq},
-        "agreement_frac": agree, "positive_jaccard": jacc,
-        "flag": ("LOW label agreement -- treat AUC cautiously"
-                 if (jacc == jacc and jacc < 0.5) else "labels broadly consistent"),
+        "label_agreement_pairwise": pairwise,
     }
 
     with open(os.path.join(args.out_dir, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
 
     # ---- stdout summary table ------------------------------------------------
-    L = metrics["label_is_repeat(n_loci>=2)"]
-    M = metrics["label_is_repeat_mapq(mapq<thr)"]
     print("\n==================== PHASE 7 REPEAT PROBE ====================")
-    print(f"reads evaluated: {len(ev)}   (neuro={len(partners)}, ref-aligned={len(ref_aligns)})")
-    print(f"dropped partners (no primary ref aln): {dropped_total}")
-    print(f"locus_gap={args.locus_gap}  mapq_thr={args.mapq_thr}")
-    print(f"{'metric':34s} {'label=n_loci>=2':>18s} {'label=mapq<thr':>16s}")
-    print("-" * 70)
-    print(f"{'#positive':34s} {L['n_positive']:>18d} {M['n_positive']:>16d}")
-    print(f"{'dispersion ROC-AUC':34s} {L['dispersion_roc_auc']:>18.4f} {M['dispersion_roc_auc']:>16.4f}")
-    print(f"{'dispersion PR-AUC':34s} {L['dispersion_pr_auc']:>18.4f} {M['dispersion_pr_auc']:>16.4f}")
-    print(f"{'degree ROC-AUC (baseline)':34s} {L['degree_roc_auc']:>18.4f} {M['degree_roc_auc']:>16.4f}")
-    print(f"{'degree PR-AUC (baseline)':34s} {L['degree_pr_auc']:>18.4f} {M['degree_pr_auc']:>16.4f}")
-    print("-" * 70)
+    print(f"dataset={args.dataset}  graph={args.graph_label}")
+    print(f"reads evaluated: {len(ev)}   (graph={len(partners)}, ref-aligned={len(ref_aligns)})")
+    print(f"dropped partners (no primary ref aln): {dropped_total}   "
+          f"locus_gap={args.locus_gap} mapq_thr={args.mapq_thr}")
+    print(f"{'label':18s} {'#pos':>8s} {'pos%':>6s} {'disp_ROC':>9s} {'disp_PR':>9s} "
+          f"{'deg_ROC':>9s} {'deg_PR':>9s}")
+    print("-" * 74)
+    for lname, desc, _ in label_defs:
+        e = labels_grid[lname]
+        print(f"{desc:18s} {e['n_positive']:>8d} {100*e['positive_frac']:>5.1f}% "
+              f"{e['dispersion_roc_auc']:>9.4f} {e['dispersion_pr_auc']:>9.4f} "
+              f"{e['degree_roc_auc']:>9.4f} {e['degree_pr_auc']:>9.4f}")
+    print("-" * 74)
     print(f"Spearman(dispersion, n_loci) = {metrics['spearman_dispersion_vs_nloci']['rho']:.4f}")
-    print(f"label agreement: {agree*100:.1f}%  positive-Jaccard={jacc:.3f}  -> "
-          f"{metrics['label_agreement']['flag']}")
+    for k, v in pairwise.items():
+        print(f"agreement {k}: {100*v['agreement_frac']:.1f}%  posJaccard={v['positive_jaccard']:.3f}"
+              f"  -> {v['flag']}")
     print("==============================================================\n")
 
     # ---- E) figures ----------------------------------------------------------
