@@ -26,9 +26,14 @@ PHASE4_DIR="$1"; REF="$2"; READS_FASTA="$3"; MINIMAP2_BIN="$4"; OUT_DIR="$5"; TH
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 NEURO_PAF="$PHASE4_DIR/neurosamble.paf"
-for req in "$NEURO_PAF" "$REF" "$READS_FASTA" "$MINIMAP2_BIN"; do
+for req in "$NEURO_PAF" "$REF" "$READS_FASTA"; do
   [[ -e "$req" ]] || { echo "[phase7][error] missing input: $req" >&2; exit 2; }
 done
+# minimap2 may be a PATH command (conda env) OR an explicit file path -- accept both.
+if ! command -v "$MINIMAP2_BIN" >/dev/null 2>&1 && [[ ! -x "$MINIMAP2_BIN" ]]; then
+  echo "[phase7][error] minimap2 not found on PATH or as an executable: $MINIMAP2_BIN" >&2
+  exit 2
+fi
 
 mkdir -p "$OUT_DIR"
 LOG="$OUT_DIR/run_phase7.log"
